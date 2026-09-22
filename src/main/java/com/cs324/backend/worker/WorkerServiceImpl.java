@@ -1,4 +1,6 @@
-package com.cs324.worker;
+package com.cs324.backend.worker;
+
+import com.cs324.backend.api.WorkerService;
 
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;

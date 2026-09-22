@@ -1,4 +1,4 @@
-package com.cs324.worker;
+package com.cs324.backend.api;
 
 import java.rmi.Remote;
 import java.rmi.RemoteException;

@@ -1,4 +1,7 @@
-package com.cs324.worker;
+package com.cs324.frontend.client;
+
+import com.cs324.backend.api.WorkerService;
+import com.cs324.backend.worker.WorkerServer;
 
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
