@@ -32,15 +32,13 @@ leader election and job processing are not implemented yet.
 ```text
 .
 +-- pom.xml
-+-- backend
-    +-- pom.xml
-    +-- src
-        +-- main
-            +-- java
-                +-- com
-                    +-- cs324
-                        +-- bootstrap
-                        +-- worker
++-- src/main/java/com/cs324
+    +-- backend
+    |   +-- api          (RMI contracts & shared DTOs)
+    |   +-- bootstrap    (Bootstrap Node)
+    |   +-- worker       (Worker Node, election/ and job/ for future work)
+    +-- frontend
+        +-- client       (manual test harnesses)
 ```
 
 ### Compile
@@ -56,13 +54,13 @@ mvn clean compile
 Start it in its own terminal:
 
 ```powershell
-mvn -pl backend exec:java
+mvn exec:java
 ```
 
 The default RMI registry port is `1099`. To use another port:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.args=2099"
+mvn exec:java "-Dexec.args=2099"
 ```
 
 ### Test with the Included Client
@@ -70,13 +68,13 @@ mvn -pl backend exec:java "-Dexec.args=2099"
 With the Bootstrap Node still running, open another terminal and run:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.bootstrap.BootstrapClientTest"
+mvn exec:java "-Dexec.mainClass=com.cs324.frontend.client.BootstrapClientTest"
 ```
 
 For a custom host or port:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.bootstrap.BootstrapClientTest" "-Dexec.args='localhost 2099'"
+mvn exec:java "-Dexec.mainClass=com.cs324.frontend.client.BootstrapClientTest" "-Dexec.args='localhost 2099'"
 ```
 
 The test client registers three workers, prints the active worker list, requests
@@ -87,7 +85,7 @@ a random worker, unregisters one worker, and prints the remaining active workers
 Start the Bootstrap Node first. Then open another terminal and run a worker:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='1 5001'"
+mvn exec:java "-Dexec.mainClass=com.cs324.backend.worker.WorkerServer" "-Dexec.args='1 5001'"
 ```
 
 Arguments are:
@@ -99,7 +97,7 @@ WorkerServer <workerId> <workerPort> [bootstrapHost] [bootstrapPort] [workerHost
 Example with an explicit Bootstrap Node address:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='2 5002 localhost 1099 localhost'"
+mvn exec:java "-Dexec.mainClass=com.cs324.backend.worker.WorkerServer" "-Dexec.args='2 5002 localhost 1099 localhost'"
 ```
 
 ### Test a Worker Node
@@ -107,7 +105,7 @@ mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dex
 With the Bootstrap Node and a Worker Node running, inspect the worker over RMI:
 
 ```powershell
-mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerClientTest" "-Dexec.args='localhost 5001 1'"
+mvn exec:java "-Dexec.mainClass=com.cs324.frontend.client.WorkerClientTest" "-Dexec.args='localhost 5001 1'"
 ```
 
 The worker test client prints the worker ID, JAC, coordinator ID, `leaderman`,

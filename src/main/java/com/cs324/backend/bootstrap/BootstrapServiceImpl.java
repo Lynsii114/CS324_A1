@@ -1,4 +1,7 @@
-package com.cs324.bootstrap;
+package com.cs324.backend.bootstrap;
+
+import com.cs324.backend.api.BootstrapService;
+import com.cs324.backend.api.WorkerInfo;
 
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
