@@ -2,9 +2,9 @@
 
 ## Bootstrap Node
 
-This project currently implements the Bootstrap Node and the basic Worker Node
-for the worker network using Java RMI, plus a launcher that runs a fixed
-six-worker cluster (worker IDs `1` through `6`).
+This project implements the Bootstrap Node, the Worker Nodes and a distributed
+leader election protocol for a six-worker cluster (worker IDs `1` through `6`),
+all communicating through Java RMI.
 
 The Bootstrap Node is a standalone Java RMI process that tracks active workers
 and exposes these remote methods:
@@ -14,19 +14,54 @@ and exposes these remote methods:
 - `getActiveWorkers()`
 - `getRandomWorker()`
 
-The Bootstrap Node only stores worker membership. It does not participate in
-leader election and does not process jobs.
+The Bootstrap Node is strictly neutral. It serves only as a central registry of
+active workers. It never participates in leader elections, never executes jobs
+and never assigns tasks; job execution and leadership are reserved for the
+worker nodes.
 
 Each Worker Node runs as a separate Java RMI process with:
 
 - a unique integer worker ID
 - Job Allocation Counter (JAC) starting at `0`
-- neighbour list
-- current coordinator ID
+- a neighbour ring (each worker links to its predecessor and successor in the
+  registry, so the ring grows dynamically as workers register)
+- current coordinator ID, initially `-1` (none)
 - `leaderman = "cs324"`
+- a thread-safe set of processed election IDs for deduplication
 
-When a Worker Node starts, it registers itself with the Bootstrap Node. Worker
-leader election and job processing are not implemented yet.
+When a Worker Node starts, it registers itself with the Bootstrap Node and
+rebuilds its neighbour ring from the active-worker registry.
+
+### Leader Election
+
+Any worker can initiate a leader election while no coordinator is present
+(coordinator ID `-1`). The algorithm fulfils the following requirements:
+
+- **Message propagation** - An `ELECTION` message is forwarded hop-by-hop
+  through neighbouring workers over the ring. Each worker re-sends the message
+  to its neighbours (except the hop it arrived from) and echoes back the merged
+  set of discovered participants, so messages terminate cleanly.
+- **Deduplication** - Every election gets a unique UUID election id. Every
+  worker maintains a thread-safe set (`ConcurrentHashMap.newKeySet()`) of
+  processed election ids; a message whose election id was already handled is
+  dropped, so no message is ever processed twice and message loops are cut.
+- **Network scope** - The election discovers every currently reachable, active
+  worker before a winner is chosen. Because each participating worker refreshes
+  its ring from the Bootstrap registry, newly joined workers are discovered as
+  well. The winner is selected only after all echoes have returned.
+- **Role separation** - The Bootstrap Node only hands out the active-worker
+  registry. Elections, winner selection and coordination happen entirely
+  between worker nodes over RMI.
+- **Tie-breaking** - Among the reachable workers, the one with the lowest JAC
+  wins (JAC counts allocated jobs, so lower means more free capacity). If two
+  or more workers tie on the same lowest JAC, the worker with the highest
+  unique Worker ID is elected. With the default cluster (every JAC = `0`)
+  worker `6` therefore wins.
+
+After the winner is chosen, the initiator broadcasts a `WinnerAnnouncement` to
+every participant, so all workers agree on the same coordinator. Initiating an
+election while a coordinator is already present is refused; reset the
+coordinators first if you want to re-run (see the `reset` command below).
 
 ### Six-Worker Cluster (IDs 1-6)
 
@@ -196,13 +231,14 @@ java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start loc
 In a third terminal:
 
 ```powershell
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient status
 ```
 
 Expected output ends with:
 
 ```text
 6/6 workers reachable over RMI
+No coordinator elected yet - run: ClusterStatusClient election [initiatorId]
 ```
 
 You can also inspect a single worker directly, e.g. worker 6:
@@ -211,7 +247,32 @@ You can also inspect a single worker directly, e.g. worker 6:
 java -cp target/classes com.cs324.frontend.client.WorkerClientTest localhost 5006 6
 ```
 
-#### Step 5 - Monitor or stop the workers
+#### Step 5 - Run a leader election
+
+With no coordinator present, initiate an election from any worker (here worker
+1):
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient election 1
+```
+
+Because every worker starts with JAC `0`, the six workers tie and the highest
+worker ID wins:
+
+```text
+Election result: Coordinator elected: worker 6 (JAC=0) across 6 reachable workers [electionId=...]
+...
+Cluster is coordinated by worker 6
+```
+
+All six workers now report `coordinator=6`. While a coordinator is present, a
+new election is refused. Use `reset` (followed by `election`) to re-run:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient reset
+```
+
+#### Step 6 - Monitor or stop the workers
 
 Check which worker processes are alive:
 
@@ -253,3 +314,63 @@ With an explicit Bootstrap Node address:
 ```powershell
 java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006 localhost 1099 localhost
 ```
+
+### ClusterStatusClient Reference
+
+`ClusterStatusClient` drives demos and verification of the six-worker cluster:
+
+| Command | Purpose |
+|---------|---------|
+| `status [host] [bootstrapPort]` | Print Bootstrap registration and per-worker state (JAC, coordinator, neighbour count). |
+| `election [initiatorId] [host] [bootstrapPort]` | Have the given worker (default `1`) start a leader election, then re-print status. |
+| `reset [host] [bootstrapPort]` | Set every worker's coordinator back to `-1`, so a new election can be run. |
+| `bump-jac <workerId> <amount> [host] [bootstrapPort]` | Increase a worker's JAC to exercise JAC-priority tie-breaking. |
+
+### Tie-Breaking Example
+
+The election prefers the lowest JAC. To prove it, raise worker 6's JAC so its
+JAC is no longer the minimum, then re-elect:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient reset
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient bump-jac 6 3
+java -cp target/classes com.cs324.frontend.client.ClusterStatusClient election 5
+```
+
+This time the winner is worker `5` (`JAC=0`): workers `1`-`5` are tied on the
+lowest JAC and the tie is broken by the highest worker ID:
+
+```text
+Election result: Coordinator elected: worker 5 (JAC=0) across 6 reachable workers [electionId=...]
+```
+
+### Watching the Election Propagate
+
+Each worker logs its election activity in its own file. During an election you
+can watch the ELECTION messages hop around the ring and see deduplication in
+action:
+
+```text
+[Worker 1] election <electionId> started, JAC=0, neighbours=2
+[Worker 2] dropping duplicate election message <electionId> from worker 3
+...
+[Worker 6] dropping duplicate election message <electionId> from worker 1
+[Worker 1] election <electionId> winner: worker 6 (JAC=0) across 6 reachable workers
+```
+
+Because each worker processes an election id at most once, the second arrival of
+every message is dropped and the flood terminates after every reachable worker
+has been discovered once.
+
+### Why the Bootstrap Node Stays Neutral
+
+The Bootstrap Node's log only ever shows registrations and unregistrations:
+
+```text
+[Bootstrap] Registered worker: WorkerInfo{workerId=1, host='localhost', port=5001}
+...
+```
+
+Elections, winner selection and coordination are entirely between worker nodes:
+the bootstrap merely answers `getActiveWorkers()`, which the workers use to
+rebuild their neighbour ring and discover each other over RMI.

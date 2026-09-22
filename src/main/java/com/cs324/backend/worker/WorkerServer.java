@@ -31,13 +31,16 @@ public class WorkerServer {
 
         try {
             Registry workerRegistry = getOrCreateRegistry(workerPort);
-            WorkerServiceImpl worker = new WorkerServiceImpl(workerId);
-            workerRegistry.rebind(serviceName, worker);
+            WorkerInfo self = new WorkerInfo(workerId, workerHost, workerPort);
 
             Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
             BootstrapService bootstrap = (BootstrapService) bootstrapRegistry.lookup(BootstrapServer.SERVICE_NAME);
-            WorkerInfo workerInfo = new WorkerInfo(workerId, workerHost, workerPort);
-            bootstrap.registerWorker(workerInfo);
+
+            WorkerServiceImpl worker = new WorkerServiceImpl(workerId, self, bootstrap);
+            workerRegistry.rebind(serviceName, worker);
+
+            bootstrap.registerWorker(self);
+            worker.syncNeighbours();
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
 
@@ -45,7 +48,8 @@ public class WorkerServer {
             System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);
             System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
             System.out.println("Initial state: JAC=0, coordinatorId=" + worker.getCurrentCoordinatorId()
-                    + ", leaderman=" + worker.getLeaderman());
+                    + " (none), leaderman=" + worker.getLeaderman()
+                    + ", neighbours=" + worker.getNeighbours());
         } catch (Exception e) {
             System.err.println("Worker Node failed to start: " + e.getMessage());
             e.printStackTrace();
