@@ -37,13 +37,22 @@ public class WorkerServer {
             Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
             BootstrapService bootstrap = (BootstrapService) bootstrapRegistry.lookup(BootstrapServer.SERVICE_NAME);
             WorkerInfo workerInfo = new WorkerInfo(workerId, workerHost, workerPort);
+            WorkerInfo neighbourInfo = bootstrap.getRandomWorker();
             bootstrap.registerWorker(workerInfo);
+
+            if (neighbourInfo != null) {
+                connectToNeighbour(worker, workerId, neighbourInfo);
+                System.out.println("Connected to neighbour Worker Node " + neighbourInfo.getWorkerId());
+            }
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
 
             System.out.println("Worker Node " + workerId + " started on port " + workerPort);
             System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);
             System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
+            if (neighbourInfo == null) {
+                System.out.println("No active workers were available; starting without a neighbour");
+            }
             System.out.println("Initial state: JAC=0, coordinatorId=" + worker.getCurrentCoordinatorId()
                     + ", leaderman=" + worker.getLeaderman());
         } catch (Exception e) {
@@ -51,6 +60,16 @@ public class WorkerServer {
             e.printStackTrace();
             System.exit(1);
         }
+    }
+
+    private static void connectToNeighbour(WorkerService worker, int workerId, WorkerInfo neighbourInfo)
+            throws Exception {
+        Registry neighbourRegistry = LocateRegistry.getRegistry(neighbourInfo.getHost(), neighbourInfo.getPort());
+        WorkerService neighbour = (WorkerService) neighbourRegistry.lookup(
+                SERVICE_NAME_PREFIX + neighbourInfo.getWorkerId());
+
+        worker.addNeighbour(neighbourInfo.getWorkerId());
+        neighbour.addNeighbour(workerId);
     }
 
     private static Registry getOrCreateRegistry(int port) throws Exception {
