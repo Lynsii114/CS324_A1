@@ -1,4 +1,8 @@
-package com.cs324.bootstrap;
+package com.cs324.frontend.client;
+
+import com.cs324.backend.api.BootstrapService;
+import com.cs324.backend.api.WorkerInfo;
+import com.cs324.backend.bootstrap.BootstrapServer;
 
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;

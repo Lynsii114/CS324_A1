@@ -1,4 +1,4 @@
-package com.cs324.bootstrap;
+package com.cs324.backend.api;
 
 import java.io.Serializable;
 import java.util.Objects;

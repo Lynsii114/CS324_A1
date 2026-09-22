@@ -1,4 +1,4 @@
-package com.cs324.bootstrap;
+package com.cs324.backend.bootstrap;
 
 import java.rmi.server.ExportException;
 import java.rmi.registry.LocateRegistry;
