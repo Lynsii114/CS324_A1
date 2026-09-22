@@ -31,11 +31,10 @@ public class WorkerServer {
 
         try {
             Registry workerRegistry = getOrCreateRegistry(workerPort);
-            WorkerServiceImpl worker = new WorkerServiceImpl(workerId);
-            workerRegistry.rebind(serviceName, worker);
-
             Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
             BootstrapService bootstrap = (BootstrapService) bootstrapRegistry.lookup(BootstrapServer.SERVICE_NAME);
+            WorkerServiceImpl worker = new WorkerServiceImpl(workerId, bootstrap);
+            workerRegistry.rebind(serviceName, worker);
             WorkerInfo workerInfo = new WorkerInfo(workerId, workerHost, workerPort);
             bootstrap.registerWorker(workerInfo);
 
