@@ -12,7 +12,7 @@ public interface BootstrapService extends Remote {
 
     void registerWorker(WorkerInfo worker) throws RemoteException;
 
-    void unregisterWorker(String workerId) throws RemoteException;
+    void unregisterWorker(int workerId) throws RemoteException;
 
     List<WorkerInfo> getActiveWorkers() throws RemoteException;
 

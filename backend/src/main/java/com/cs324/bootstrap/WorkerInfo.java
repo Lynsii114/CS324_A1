@@ -10,17 +10,17 @@ import java.util.Objects;
 public class WorkerInfo implements Serializable {
     private static final long serialVersionUID = 1L;
 
-    private final String workerId;
+    private final int workerId;
     private final String host;
     private final int port;
 
-    public WorkerInfo(String workerId, String host, int port) {
+    public WorkerInfo(int workerId, String host, int port) {
         this.workerId = workerId;
         this.host = host;
         this.port = port;
     }
 
-    public String getWorkerId() {
+    public int getWorkerId() {
         return workerId;
     }
 
@@ -37,7 +37,7 @@ public class WorkerInfo implements Serializable {
         if (this == o) return true;
         if (!(o instanceof WorkerInfo)) return false;
         WorkerInfo other = (WorkerInfo) o;
-        return Objects.equals(workerId, other.workerId);
+        return workerId == other.workerId;
     }
 
     @Override
@@ -47,6 +47,6 @@ public class WorkerInfo implements Serializable {
 
     @Override
     public String toString() {
-        return "WorkerInfo{workerId='" + workerId + "', host='" + host + "', port=" + port + "}";
+        return "WorkerInfo{workerId=" + workerId + ", host='" + host + "', port=" + port + "}";
     }
 }

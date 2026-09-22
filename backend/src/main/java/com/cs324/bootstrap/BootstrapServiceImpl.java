@@ -16,7 +16,7 @@ public class BootstrapServiceImpl extends UnicastRemoteObject implements Bootstr
     private static final long serialVersionUID = 1L;
 
     // ConcurrentHashMap gives us thread-safe register/unregister/read without external locking.
-    private final Map<String, WorkerInfo> activeWorkers = new ConcurrentHashMap<>();
+    private final Map<Integer, WorkerInfo> activeWorkers = new ConcurrentHashMap<>();
 
     protected BootstrapServiceImpl() throws RemoteException {
         super();
@@ -24,15 +24,15 @@ public class BootstrapServiceImpl extends UnicastRemoteObject implements Bootstr
 
     @Override
     public void registerWorker(WorkerInfo worker) throws RemoteException {
-        if (worker == null || worker.getWorkerId() == null) {
-            throw new IllegalArgumentException("worker and worker id must not be null");
+        if (worker == null) {
+            throw new IllegalArgumentException("worker must not be null");
         }
         activeWorkers.put(worker.getWorkerId(), worker);
         System.out.println("[Bootstrap] Registered worker: " + worker);
     }
 
     @Override
-    public void unregisterWorker(String workerId) throws RemoteException {
+    public void unregisterWorker(int workerId) throws RemoteException {
         WorkerInfo removed = activeWorkers.remove(workerId);
         if (removed != null) {
             System.out.println("[Bootstrap] Unregistered worker: " + removed);

@@ -17,9 +17,9 @@ public class BootstrapClientTest {
         Registry registry = LocateRegistry.getRegistry(host, port);
         BootstrapService bootstrap = (BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
 
-        bootstrap.registerWorker(new WorkerInfo("worker-1", "localhost", 5001));
-        bootstrap.registerWorker(new WorkerInfo("worker-2", "localhost", 5002));
-        bootstrap.registerWorker(new WorkerInfo("worker-3", "localhost", 5003));
+        bootstrap.registerWorker(new WorkerInfo(1, "localhost", 5001));
+        bootstrap.registerWorker(new WorkerInfo(2, "localhost", 5002));
+        bootstrap.registerWorker(new WorkerInfo(3, "localhost", 5003));
 
         List<WorkerInfo> active = bootstrap.getActiveWorkers();
         System.out.println("Active workers: " + active);
@@ -27,7 +27,7 @@ public class BootstrapClientTest {
         WorkerInfo random = bootstrap.getRandomWorker();
         System.out.println("Randomly selected worker: " + random);
 
-        bootstrap.unregisterWorker("worker-2");
-        System.out.println("Active workers after unregistering worker-2: " + bootstrap.getActiveWorkers());
+        bootstrap.unregisterWorker(2);
+        System.out.println("Active workers after unregistering worker 2: " + bootstrap.getActiveWorkers());
     }
 }
