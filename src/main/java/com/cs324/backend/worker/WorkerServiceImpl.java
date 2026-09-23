@@ -313,7 +313,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
      * completes the coordinator's term ends and a fresh election is triggered
      * (see {@link #maybeEndCoordinatorTerm()}).
      */
-    private int runJob(int termSlot, Callable<Integer> job) throws RemoteException {
+    private <T> T runJob(int termSlot, Callable<T> job) throws RemoteException {
         System.out.println("[Worker " + workerId + "] submitted job #" + termSlot
                 + " -> queued on executor");
         try {
@@ -450,7 +450,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     /** Runs a worker-side partial computation on the shared job executor. */
-    private int runPartialJob(Callable<Integer> job) throws RemoteException {
+    private <T> T runPartialJob(Callable<T> job) throws RemoteException {
         try {
             return jobExecutor.submit(job).get();
         } catch (ExecutionException e) {
@@ -493,6 +493,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             WorkerService worker = reachableWorkers.get(index);
             int assignedWorkerId = worker.getWorkerId();
 
+            if (assignedWorkerId != workerId) {
+                recordJobAllocation();
+            }
+
             try {
                 System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
                         + assignedWorkerId + ", section=" + chunk);
@@ -532,6 +536,81 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
                     + numbers + ", primes=" + count + ", JAC=" + updatedJac);
             return count;
+        });
+    }
+
+    @Override
+    public long submitPrimeSum(int start, int end) throws RemoteException {
+        if (start < 1 || end < start) {
+            throw new IllegalArgumentException("invalid range: start=" + start + ", end=" + end);
+        }
+        requireCoordinator();
+
+        int termSlot = claimTermSlot();
+        return runJob(termSlot, () -> executeSubmitPrimeSum(start, end));
+    }
+
+    private long executeSubmitPrimeSum(int start, int end) throws RemoteException {
+        List<WorkerService> reachableWorkers = getReachableWorkerServices();
+        int workerCount = Math.min(reachableWorkers.size(), end - start + 1);
+        if (workerCount == 0) {
+            throw new RemoteException("No reachable workers are available for PRIMESUM job");
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMESUM job received -> start=" + start
+                + ", end=" + end + ", reachableWorkers=" + reachableWorkers.size()
+                + ", assignedWorkers=" + workerCount);
+
+        long totalSum = 0;
+        int segmentStart = start;
+        for (int index = 0; index < workerCount; index++) {
+            int remainingLength = end - segmentStart + 1;
+            int remainingWorkers = workerCount - index;
+            int chunkSize = (remainingLength + remainingWorkers - 1) / remainingWorkers;
+            int segmentEnd = segmentStart + chunkSize - 1;
+
+            WorkerService worker = reachableWorkers.get(index);
+            int assignedWorkerId = worker.getWorkerId();
+
+            if (assignedWorkerId != workerId) {
+                recordJobAllocation();
+            }
+
+            try {
+                System.out.println("[Worker " + workerId + "] PRIMESUM assigning -> toWorkerId="
+                        + assignedWorkerId + ", range=[" + segmentStart + ", " + segmentEnd + "]");
+                long partialSum = worker.sumPrimeRange(segmentStart, segmentEnd);
+                totalSum += partialSum;
+                System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
+                        + assignedWorkerId + ", sum=" + partialSum + ", runningTotal=" + totalSum);
+            } catch (Exception e) {
+                throw new RemoteException("PRIMESUM job failed while assigning worker "
+                        + assignedWorkerId, e);
+            }
+
+            segmentStart = segmentEnd + 1;
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMESUM final result -> sum=" + totalSum);
+        return totalSum;
+    }
+
+    @Override
+    public long sumPrimeRange(int start, int end) throws RemoteException {
+        if (start < 1 || end < start) {
+            throw new IllegalArgumentException("invalid range: start=" + start + ", end=" + end);
+        }
+        return runPartialJob(() -> {
+            long sum = 0;
+            for (int n = start; n <= end; n++) {
+                if (isPrime(n)) {
+                    sum += n;
+                }
+            }
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] PRIMESUM partial compute -> range=["
+                    + start + ", " + end + "], sum=" + sum + ", JAC=" + updatedJac);
+            return sum;
         });
     }
 
