@@ -112,3 +112,71 @@ mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerClientTest" "
 
 The worker test client prints the worker ID, JAC, coordinator ID, `leaderman`,
 and verifies that neighbours can be added and removed.
+
+### Test Leader Election with 6 Workers
+
+This test does not implement or run computational jobs. All workers keep
+`JAC=0`, so the election tie-break rule selects the highest worker ID:
+worker `6`.
+
+Open one terminal for the Bootstrap Node:
+
+```powershell
+mvn -pl backend exec:java
+```
+
+Open six more terminals, one per worker:
+
+```powershell
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='1 5001'"
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='2 5002'"
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='3 5003'"
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='4 5004'"
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='5 5005'"
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerServer" "-Dexec.args='6 5006'"
+```
+
+After all six workers have registered, open one more terminal and run:
+
+```powershell
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerElectionTest"
+```
+
+The test client connects workers in a ring:
+
+```text
+1 -- 2 -- 3 -- 4 -- 5 -- 6
+|                         |
++-------------------------+
+```
+
+Expected flow:
+
+```text
+Bootstrap
+    ↓
+6 Workers register
+    ↓
+Workers connect as neighbours
+    ↓
+Election starts at worker 1
+    ↓
+ELECTION messages compare worker IDs and JAC values
+    ↓
+All JAC values are 0, so the tie chooses highest ID
+    ↓
+Worker 6 is selected as coordinator
+    ↓
+COORDINATOR messages propagate
+    ↓
+All reachable workers report coordinatorId=6
+```
+
+Look for these console messages:
+
+- Bootstrap terminal: `[Bootstrap] Registered worker: ...`
+- Worker terminals: `NEIGHBOUR connected`, `ELECTION received`,
+  `ELECTION forwarding`, `COORDINATOR broadcast`,
+  `COORDINATOR received`, and `COORDINATOR forwarding`
+- Test terminal: final coordinator view showing every worker with
+  `coordinatorId=6`

@@ -24,6 +24,10 @@ public interface WorkerService extends Remote {
 
     void setCurrentCoordinatorId(int coordinatorId) throws RemoteException;
 
+    void startElection() throws RemoteException;
+
+    void receiveElectionMessage(ElectionMessage message) throws RemoteException;
+
     void broadcastCoordinator(int coordinatorId) throws RemoteException;
 
     void receiveCoordinatorMessage(CoordinatorMessage message) throws RemoteException;

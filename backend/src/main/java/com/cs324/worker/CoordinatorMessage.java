@@ -9,17 +9,27 @@ public final class CoordinatorMessage implements Serializable {
 
     private final UUID messageId;
     private final int coordinatorId;
+    private final int coordinatorJac;
 
     public CoordinatorMessage(int coordinatorId) {
-        this(UUID.randomUUID(), coordinatorId);
+        this(UUID.randomUUID(), coordinatorId, 0);
     }
 
     public CoordinatorMessage(UUID messageId, int coordinatorId) {
+        this(messageId, coordinatorId, 0);
+    }
+
+    public CoordinatorMessage(int coordinatorId, int coordinatorJac) {
+        this(UUID.randomUUID(), coordinatorId, coordinatorJac);
+    }
+
+    public CoordinatorMessage(UUID messageId, int coordinatorId, int coordinatorJac) {
         if (messageId == null) {
             throw new IllegalArgumentException("messageId must not be null");
         }
         this.messageId = messageId;
         this.coordinatorId = coordinatorId;
+        this.coordinatorJac = coordinatorJac;
     }
 
     public UUID getMessageId() {
@@ -30,11 +40,16 @@ public final class CoordinatorMessage implements Serializable {
         return coordinatorId;
     }
 
+    public int getCoordinatorJac() {
+        return coordinatorJac;
+    }
+
     @Override
     public String toString() {
         return "CoordinatorMessage{"
                 + "messageId=" + messageId
                 + ", coordinatorId=" + coordinatorId
+                + ", coordinatorJac=" + coordinatorJac
                 + '}';
     }
 }
