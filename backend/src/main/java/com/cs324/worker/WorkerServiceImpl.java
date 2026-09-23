@@ -231,8 +231,11 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
 
+int partialMax = Collections.max(numbers);
         int updatedJac = jobAllocationCounter.incrementAndGet();
-        int partialMax = Collections.max(numbers);
+        if (currentCoordinatorId.get() == workerId) {
+            currentCoordinatorJac.set(updatedJac);
+        }
         System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
                 + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
         return partialMax;
