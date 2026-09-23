@@ -321,6 +321,46 @@ Look for these console messages:
   `MAX partial result`, and `MAX final result`
 - Worker terminals: `MAX partial compute`
 
+### Test Distributed PRIMECOUNT Job
+
+With the six workers running and a coordinator elected (worker `6` with default
+tie-breaking), send a PRIMECOUNT job to worker `6`:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.PrimeCountClientTest
+```
+
+To provide your own comma-separated numbers:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.PrimeCountClientTest localhost 5006 6 "2,3,4,5,10,17,21,29"
+```
+
+Expected flow:
+
+```text
+Client
+    ↓
+Coordinator receives PRIMECOUNT(numbers)
+    ↓
+Coordinator finds reachable workers
+    ↓
+Coordinator divides the list as evenly as possible
+    ↓
+Each worker counts the primes in its section
+    ↓
+Coordinator sums the partial prime counts
+    ↓
+Client receives the total prime count
+```
+
+Look for these console messages:
+
+- Client terminal: `[Client] Sending PRIMECOUNT job` and `[Client] PRIMECOUNT result`
+- Coordinator terminal: `PRIMECOUNT job received`, `PRIMECOUNT assigning`,
+  `PRIMECOUNT partial result`, and `PRIMECOUNT final result`
+- Worker terminals: `PRIMECOUNT partial compute`
+
 #### Step 6 - Monitor or stop the workers
 
 Check which worker processes are alive:

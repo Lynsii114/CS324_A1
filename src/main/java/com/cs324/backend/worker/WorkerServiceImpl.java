@@ -286,6 +286,96 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         return partialMax;
     }
 
+    @Override
+    public int submitPrimeCount(List<Integer> numbers) throws RemoteException {
+        if (numbers == null || numbers.isEmpty()) {
+            throw new IllegalArgumentException("numbers must not be null or empty");
+        }
+        if (currentCoordinatorId.get() != workerId) {
+            throw new RemoteException("Worker " + workerId
+                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+        }
+
+        List<WorkerService> reachableWorkers = getReachableWorkerServices();
+        int workerCount = Math.min(reachableWorkers.size(), numbers.size());
+        if (workerCount == 0) {
+            throw new RemoteException("No reachable workers are available for PRIMECOUNT job");
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT job received -> numbers="
+                + numbers + ", reachableWorkers=" + reachableWorkers.size()
+                + ", assignedWorkers=" + workerCount);
+
+        int totalPrimes = 0;
+        int start = 0;
+        for (int index = 0; index < workerCount; index++) {
+            int remainingNumbers = numbers.size() - start;
+            int remainingWorkers = workerCount - index;
+            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
+            WorkerService worker = reachableWorkers.get(index);
+            int assignedWorkerId = worker.getWorkerId();
+
+            try {
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
+                        + assignedWorkerId + ", section=" + chunk);
+                int partialCount = worker.countPrimes(chunk);
+                totalPrimes += partialCount;
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
+                        + assignedWorkerId + ", primes=" + partialCount
+                        + ", runningTotal=" + totalPrimes);
+            } catch (Exception e) {
+                throw new RemoteException("PRIMECOUNT job failed while assigning worker "
+                        + assignedWorkerId, e);
+            }
+
+            start += chunkSize;
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT final result -> primes=" + totalPrimes);
+        return totalPrimes;
+    }
+
+    @Override
+    public int countPrimes(List<Integer> numbers) throws RemoteException {
+        if (numbers == null) {
+            throw new IllegalArgumentException("numbers must not be null");
+        }
+
+        int count = 0;
+        for (Integer value : numbers) {
+            if (value == null) {
+                throw new IllegalArgumentException("numbers must not contain null values");
+            }
+            if (isPrime(value)) {
+                count++;
+            }
+        }
+
+        int updatedJac = jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
+                + numbers + ", primes=" + count + ", JAC=" + updatedJac);
+        return count;
+    }
+
+    private static boolean isPrime(int number) {
+        if (number < 2) {
+            return false;
+        }
+        if (number == 2) {
+            return true;
+        }
+        if (number % 2 == 0) {
+            return false;
+        }
+        for (int divisor = 3; divisor <= number / divisor; divisor += 2) {
+            if (number % divisor == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * Forwards a message to every neighbour except the hop it came from,
      * merging the participant sets of all echo replies. This is what lets an

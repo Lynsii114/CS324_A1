@@ -62,4 +62,10 @@ public interface WorkerService extends Remote {
     int submitMaxJob(List<Integer> numbers) throws RemoteException;
 
     int computePartialMax(List<Integer> numbers) throws RemoteException;
+
+    /** Distributes a PRIMECOUNT job across reachable workers. Coordinator only. */
+    int submitPrimeCount(List<Integer> numbers) throws RemoteException;
+
+    /** Computes the number of primes in a section assigned by the coordinator. */
+    int countPrimes(List<Integer> numbers) throws RemoteException;
 }
