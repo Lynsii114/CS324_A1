@@ -180,3 +180,45 @@ Look for these console messages:
   `COORDINATOR received`, and `COORDINATOR forwarding`
 - Test terminal: final coordinator view showing every worker with
   `coordinatorId=6`
+
+### Test Distributed MAX Job
+
+Run the 6-worker leader election test first so all reachable workers agree on
+the coordinator. With the default test values, worker `6` becomes coordinator.
+
+Then send a MAX job to worker `6`:
+
+```powershell
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerMaxClientTest"
+```
+
+To provide your own comma-separated numbers:
+
+```powershell
+mvn -pl backend exec:java "-Dexec.mainClass=com.cs324.worker.WorkerMaxClientTest" "-Dexec.args='localhost 5006 6 4,17,2,99,31,8'"
+```
+
+Expected flow:
+
+```text
+Client
+    ↓
+Coordinator receives MAX(numbers)
+    ↓
+Coordinator finds reachable workers
+    ↓
+Coordinator divides the list as evenly as possible
+    ↓
+Each worker computes a partial maximum for its section
+    ↓
+Coordinator combines partial maximums
+    ↓
+Client receives final maximum
+```
+
+Look for these console messages:
+
+- Client terminal: `[Client] Sending MAX job` and `[Client] MAX result`
+- Coordinator terminal: `MAX job received`, `MAX assigning`,
+  `MAX partial result`, and `MAX final result`
+- Worker terminals: `MAX partial compute`

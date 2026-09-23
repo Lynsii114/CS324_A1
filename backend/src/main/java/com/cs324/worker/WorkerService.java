@@ -5,8 +5,7 @@ import java.rmi.RemoteException;
 import java.util.List;
 
 /**
- * RMI-exposed contract for a Worker Node. This exposes worker state only;
- * leader election and job processing are intentionally not implemented yet.
+ * RMI-exposed contract for a Worker Node.
  */
 public interface WorkerService extends Remote {
 
@@ -31,6 +30,10 @@ public interface WorkerService extends Remote {
     void broadcastCoordinator(int coordinatorId) throws RemoteException;
 
     void receiveCoordinatorMessage(CoordinatorMessage message) throws RemoteException;
+
+    int submitMaxJob(List<Integer> numbers) throws RemoteException;
+
+    int computePartialMax(List<Integer> numbers) throws RemoteException;
 
     String getLeaderman() throws RemoteException;
 }
