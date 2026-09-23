@@ -25,4 +25,6 @@ public interface WorkerService extends Remote {
     void setCurrentCoordinatorId(int coordinatorId) throws RemoteException;
 
     String getLeaderman() throws RemoteException;
+
+    int countPrimes(List<Integer> numbers) throws RemoteException;
 }

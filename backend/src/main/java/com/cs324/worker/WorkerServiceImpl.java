@@ -69,6 +69,31 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
+    public int countPrimes(List<Integer> numbers) throws RemoteException {
+        if (numbers == null) {
+            throw new IllegalArgumentException("numbers must not be null");
+        }
+        int count = 0;
+        for (Integer value : numbers) {
+            if (value == null) {
+                throw new IllegalArgumentException("numbers must not contain null values");
+            }
+            if (isPrime(value)) count++;
+        }
+        return count;
+    }
+
+    private static boolean isPrime(int number) {
+        if (number < 2) return false;
+        if (number == 2) return true;
+        if (number % 2 == 0) return false;
+        for (int divisor = 3; divisor <= number / divisor; divisor += 2) {
+            if (number % divisor == 0) return false;
+        }
+        return true;
+    }
+
+    @Override
     public String toString() {
         return "WorkerServiceImpl{"
                 + "workerId=" + workerId
