@@ -1,4 +1,7 @@
-package com.cs324.worker;
+package com.cs324.frontend.client;
+
+import com.cs324.backend.api.WorkerService;
+import com.cs324.backend.worker.WorkerServer;
 
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
@@ -18,8 +21,9 @@ public class WorkerClientTest {
 
         System.out.println("Worker ID: " + worker.getWorkerId());
         System.out.println("JAC: " + worker.getJobAllocationCounter());
-        System.out.println("Coordinator ID: " + worker.getCurrentCoordinatorId());
+        System.out.println("Coordinator ID: " + formatCoordinator(worker.getCurrentCoordinatorId()));
         System.out.println("Leaderman: " + worker.getLeaderman());
+        System.out.println("Neighbours: " + worker.getNeighbours());
 
         worker.addNeighbour(2);
         worker.addNeighbour(3);
@@ -27,5 +31,9 @@ public class WorkerClientTest {
 
         worker.removeNeighbour(2);
         System.out.println("Neighbours after remove: " + worker.getNeighbours());
+    }
+
+    private static String formatCoordinator(int coordinatorId) {
+        return coordinatorId == WorkerService.NO_COORDINATOR ? "none" : String.valueOf(coordinatorId);
     }
 }
