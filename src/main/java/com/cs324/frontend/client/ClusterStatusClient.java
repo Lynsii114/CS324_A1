@@ -60,6 +60,7 @@ public class ClusterStatusClient {
                 int coordinator = worker.getCurrentCoordinatorId();
                 coordinators.add(coordinator);
                 System.out.println("Worker " + workerId + " OK: JAC=" + worker.getJobAllocationCounter()
+                        + ", jobsThisTerm=" + worker.getJobsThisTerm()
                         + ", coordinator=" + formatCoordinator(coordinator)
                         + ", neighbours=" + worker.getNeighbours().size()
                         + ", leaderman=" + worker.getLeaderman());
