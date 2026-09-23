@@ -410,7 +410,7 @@ java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006 localhost 1
 
 | Command | Purpose |
 |---------|---------|
-| `status [host] [bootstrapPort]` | Print Bootstrap registration and per-worker state (JAC, coordinator, neighbour count). |
+| `status [host] [bootstrapPort]` | Print Bootstrap registration and per-worker state (JAC, `jobsThisTerm`, coordinator, neighbour count). |
 | `election [initiatorId] [host] [bootstrapPort]` | Have the given worker (default `1`) start a leader election, then re-print status. |
 | `reset [host] [bootstrapPort]` | Set every worker's coordinator back to `-1`, so a new election can be run. |
 | `bump-jac <workerId> <amount> [host] [bootstrapPort]` | Increase a worker's JAC to exercise JAC-priority tie-breaking. |
@@ -452,6 +452,97 @@ Because elections prefer the worker with the lowest JAC, JAC growth directly
 influences future leadership: after a coordinator has delegated enough work,
 `reset` the coordinators and run a new election to let lower-JAC workers
 become coordinator (see the tie-breaking example above).
+
+### 5-Job Coordinator Term
+
+A coordinator may process at most **5 submitted jobs** in a single term. Each
+complete client job (MAX or PRIMECOUNT) consumes one of the five slots. The
+per-term counter `jobsThisTerm` is **kept completely separate from the JAC**:
+the JAC counts every job section a worker handles (including partial computes),
+while `jobsThisTerm` counts only whole jobs submitted to the coordinator.
+
+How the term works:
+
+1. A job that arrives when the coordinator still has budget claims a slot
+   (`jobsThisTerm` goes 1 → 2 → 3 → 4 → 5).
+2. Right after the fifth job completes, the coordinator **demotes itself**
+   back to `NO_COORDINATOR` and immediately starts a **new distributed leader
+   election**.
+3. While that election is running, no jobs can be processed: submissions are
+   refused with `Coordinator term ended after 5 jobs; no jobs can be processed
+   until the next leader election completes` (or are refused because no
+   coordinator is present yet).
+4. Every worker records the newly elected coordinator; if a worker is elected
+   coordinator, its `jobsThisTerm` resets to zero for the fresh term.
+
+Because re-elections use the normal JAC-based rules, a coordinator that
+delegated a lot of work is not automatically re-elected. In the logs below the
+term-1 coordinator (worker 6, `JAC=30`) hands over to worker 5 (`JAC=5`):
+
+```text
+[Worker 6] completed 5 jobs this term - ending term and starting a new leader election
+[Worker 6] term re-election result: Coordinator elected: worker 5 (JAC=5) across 6 reachable workers [electionId=...]
+[Worker 6] coordinator set to 5 (was -1)
+```
+
+`ClusterStatusClient status` now also prints `jobsThisTerm` for every worker so
+you can watch the budget fill:
+
+```text
+Worker 6 OK: JAC=30, jobsThisTerm=5, coordinator=5, neighbours=2, leaderman=cs324
+```
+
+**Test procedure (deterministic):** with the six workers running and a
+coordinator elected, submit the MAX job five times from five client terminals:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.WorkerMaxClientTest
+```
+
+After the 5th result returns, the coordinator's terminal shows `completed 5
+jobs this term` followed by the term re-election result, and the cluster is
+coordinated by a fresh leader. A 6th submission sent while the old term is
+still the active coordinator is rejected until the new leader is announced.
+
+### Multithreaded Job Execution
+
+Each Worker Node owns a single `ExecutorService` (one shared pool per process).
+Both coordinator jobs (`submitMaxJob`, `submitPrimeCount`) and partial
+computations (`computePartialMax`, `countPrimes`) run on that pool, so several
+clients can be served in parallel on one worker.
+
+**Synchronization strategy** — every shared value is a concurrent primitive, so
+no coarse locks are needed around the job logic:
+
+| Shared state                     | Primitive                     |
+|----------------------------------|-------------------------------|
+| JAC (`jobAllocationCounter`)     | `AtomicInteger`               |
+| Per-term job counter             | `AtomicInteger` (CAS claims)  |
+| Coordinator id                   | `AtomicInteger` (CAS for the term hand-over) |
+| Processed election ids           | `ConcurrentHashMap.newKeySet()` |
+| Neighbour ring                   | `ConcurrentHashMap.newKeySet()`, replaced atomically in a `synchronized` `refreshNeighbours()` |
+
+The job pool is sized larger than the 5-job term limit
+(`max(6, availableProcessors)`), which guarantees the coordinator never
+deadlocks when it runs five concurrent jobs and still needs to borrow one more
+thread to compute its own local section. Executor threads are daemon threads so
+they never keep a worker JVM alive after it is shut down.
+
+To see the multithreading in action, check the worker logs while clients submit
+overlapping jobs - each job logs the pool thread running it:
+
+```text
+[Worker 5] submitted job #2 -> queued on executor
+[Worker 5] executing submitted job #2 on thread job-5-1
+[Worker 5] executing submitted job #3 on thread job-5-2
+```
+
+If more jobs are submitted than the current term allows, the surplus is refused
+instead of being queued into the next term:
+
+```text
+java.rmi.RemoteException: Coordinator term ended after 5 jobs; no jobs can be processed until the next leader election completes
+```
 
 ### Watching the Election Propagate
 

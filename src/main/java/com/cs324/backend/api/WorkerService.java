@@ -13,6 +13,9 @@ public interface WorkerService extends Remote {
     /** Sentinel used when no coordinator has been elected yet. */
     int NO_COORDINATOR = -1;
 
+    /** A coordinator may process at most this many submitted jobs during one term. */
+    int COORDINATOR_TERM_LIMIT = 5;
+
     int getWorkerId() throws RemoteException;
 
     int getJobAllocationCounter() throws RemoteException;
@@ -28,6 +31,13 @@ public interface WorkerService extends Remote {
     int recordJobAllocation() throws RemoteException;
 
     int resetJobAllocationCounter() throws RemoteException;
+
+    /**
+     * How many submitted jobs this worker has handled as coordinator in the
+     * current term (isolated from the JAC). Reset to zero at the start of each
+     * new term in which this worker is elected coordinator.
+     */
+    int getJobsThisTerm() throws RemoteException;
 
     List<WorkerInfo> getNeighbours() throws RemoteException;
 

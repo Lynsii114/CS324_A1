@@ -25,7 +25,11 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -51,6 +55,24 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>The Bootstrap Node is never involved beyond looking up the active worker
  *       registry; it does not participate in the election.</li>
  * </ul>
+ *
+ * <p><b>Concurrency strategy (5-job coordinator terms + multithreaded
+ * execution):</b> jobs arrive over RMI and can overlap, so all shared mutable
+ * state is guarded by concurrent primitives instead of coarse locks:
+ * <ul>
+ *   <li>{@link #jobAllocationCounter} (JAC) - {@link AtomicInteger}.</li>
+ *   <li>{@link #jobsThisTerm} (per-term submitted-job counter, isolated from the
+ *       JAC) - {@link AtomicInteger}.</li>
+ *   <li>{@link #currentCoordinatorId} - {@link AtomicInteger}.</li>
+ *   <li>{@link #processedElectionIds} - a concurrent key set, so an election
+ *       message is processed at most once even under concurrent arrivals.</li>
+ *   <li>{@link #neighbours} - a concurrent key set; the whole ring is swapped
+ *       atomically inside the {@code synchronized} {@link #refreshNeighbours()}.</li>
+ * </ul>
+ * A single {@link ExecutorService} ({@link #jobExecutor}) runs submitted jobs
+ * and partial computations concurrently. The pool is sized larger than the
+ * coordinator term limit so the coordinator can always borrow another thread for
+ * its own local section without deadlocking.
  */
 public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerService {
     private static final long serialVersionUID = 1L;
@@ -66,6 +88,23 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final Set<WorkerInfo> neighbours = ConcurrentHashMap.newKeySet();
     private final String leaderman = "cs324";
 
+    /**
+     * Number of submitted jobs handled as coordinator during the current term.
+     * Deliberately separate from the JAC: the JAC counts every single job
+     * section a worker processes; this counter counts only complete client jobs
+     * submitted to this worker while it is the term coordinator.
+     */
+    private final AtomicInteger jobsThisTerm = new AtomicInteger(0);
+
+    private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
+
+    /**
+     * Runs submitted jobs and partial computations concurrently. Daemon threads
+     * never keep the JVM alive; RMI exports already do that. Built in the
+     * constructor because the pool must be sized with the worker id in hand.
+     */
+    private final ExecutorService jobExecutor;
+
     public WorkerServiceImpl(int workerId, WorkerInfo self, BootstrapService bootstrapService)
             throws RemoteException {
         super();
@@ -73,6 +112,14 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         this.registeredHost = self.getHost();
         this.registeredPort = self.getPort();
         this.bootstrapService = bootstrapService;
+        this.jobExecutor = Executors.newFixedThreadPool(
+                Math.max(WorkerService.COORDINATOR_TERM_LIMIT + 1, Runtime.getRuntime().availableProcessors()),
+                runnable -> {
+                    Thread thread = new Thread(runnable,
+                            "job-" + workerId + "-" + jobThreadCounter.incrementAndGet());
+                    thread.setDaemon(true);
+                    return thread;
+                });
     }
 
     @Override
@@ -96,6 +143,11 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         System.out.println("[Worker " + workerId + "] JAC changed to " + updated
                 + " (assigned a job section to another worker)");
         return updated;
+    }
+
+    @Override
+    public int getJobsThisTerm() throws RemoteException {
+        return jobsThisTerm.get();
     }
 
     @Override
@@ -145,8 +197,21 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     @Override
     public void setCurrentCoordinatorId(int coordinatorId) throws RemoteException {
-        currentCoordinatorId.set(coordinatorId);
-        System.out.println("[Worker " + workerId + "] coordinator set to " + coordinatorId);
+        recordCoordinator(coordinatorId);
+    }
+
+    /**
+     * Atomically records the current coordinator. Whenever this node becomes the
+     * coordinator itself, a fresh term begins: the per-term submitted-job counter
+     * is reset to zero so the new coordinator gets a clean five-job budget.
+     */
+    private void recordCoordinator(int coordinatorId) {
+        int previous = currentCoordinatorId.getAndSet(coordinatorId);
+        if (coordinatorId == workerId) {
+            jobsThisTerm.set(0);
+        }
+        System.out.println("[Worker " + workerId + "] coordinator set to " + coordinatorId
+                + (previous == coordinatorId ? "" : " (was " + previous + ")"));
     }
 
     @Override
@@ -185,7 +250,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         allParticipants.add(self);
 
         CandidateInfo winner = selectWinner(allParticipants);
-        currentCoordinatorId.set(winner.getWorkerId());
+        recordCoordinator(winner.getWorkerId());
 
         System.out.println("[Worker " + workerId + "] election " + electionId + " winner: worker "
                 + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
@@ -225,7 +290,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             return;
         }
         processedElectionIds.add(announcement.getElectionId());
-        currentCoordinatorId.set(announcement.getWinner().getWorkerId());
+        recordCoordinator(announcement.getWinner().getWorkerId());
         System.out.println("[Worker " + workerId + "] recorded coordinator worker "
                 + announcement.getWinner().getWorkerId() + " (JAC=" + announcement.getWinner().getJac()
                 + ") for election " + announcement.getElectionId());
@@ -236,11 +301,96 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
+        requireCoordinator();
+
+        int termSlot = claimTermSlot();
+        return runJob(termSlot, () -> executeSubmitMaxJob(numbers));
+    }
+
+    /**
+     * Runs one submitted coordinator job on the executor. The term budget is
+     * consumed at submission time, and after the last accepted job of a term
+     * completes the coordinator's term ends and a fresh election is triggered
+     * (see {@link #maybeEndCoordinatorTerm()}).
+     */
+    private int runJob(int termSlot, Callable<Integer> job) throws RemoteException {
+        System.out.println("[Worker " + workerId + "] submitted job #" + termSlot
+                + " -> queued on executor");
+        try {
+            return jobExecutor.submit(() -> {
+                System.out.println("[Worker " + workerId + "] executing submitted job #" + termSlot
+                        + " on thread " + Thread.currentThread().getName());
+                return job.call();
+            }).get();
+        } catch (ExecutionException e) {
+            throw unwrapExecution(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Job interrupted", e);
+        } finally {
+            maybeEndCoordinatorTerm();
+        }
+    }
+
+    private void requireCoordinator() throws RemoteException {
         if (currentCoordinatorId.get() != workerId) {
             throw new RemoteException("Worker " + workerId
                     + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
         }
+    }
 
+    /**
+     * Reserves one of the coordinator's per-term submitted-job slots. An atomic
+     * check-then-increment keeps the counter at most {@link
+     * WorkerService#COORDINATOR_TERM_LIMIT} for the current term.
+     */
+    private int claimTermSlot() throws RemoteException {
+        for (; ; ) {
+            int current = jobsThisTerm.get();
+            if (current >= WorkerService.COORDINATOR_TERM_LIMIT) {
+                throw new RemoteException("Coordinator term ended after "
+                        + WorkerService.COORDINATOR_TERM_LIMIT + " jobs; no jobs can be processed "
+                        + "until the next leader election completes");
+            }
+            if (jobsThisTerm.compareAndSet(current, current + 1)) {
+                return current + 1;
+            }
+        }
+    }
+
+    /**
+     * Ends the coordinator's term as soon as the last accepted job completes:
+     * the coordinator demotes itself and immediately starts a new distributed
+     * leader election. The compare-and-set ensures exactly one thread performs
+     * the term hand-over even when several jobs complete at once.
+     */
+    private void maybeEndCoordinatorTerm() {
+        if (jobsThisTerm.get() < WorkerService.COORDINATOR_TERM_LIMIT) {
+            return;
+        }
+        if (!currentCoordinatorId.compareAndSet(workerId, NO_COORDINATOR)) {
+            return; // another finished job already ended this term
+        }
+        System.out.println("[Worker " + workerId + "] completed "
+                + WorkerService.COORDINATOR_TERM_LIMIT + " jobs this term - ending term "
+                + "and starting a new leader election");
+        try {
+            String result = initiateElection();
+            System.out.println("[Worker " + workerId + "] term re-election result: " + result);
+        } catch (RemoteException e) {
+            System.err.println("[Worker " + workerId + "] term re-election failed: " + e.getMessage());
+        }
+    }
+
+    private RemoteException unwrapExecution(ExecutionException e) {
+        Throwable cause = e.getCause();
+        if (cause instanceof RemoteException remoteException) {
+            return remoteException;
+        }
+        return new RemoteException("Job failed: " + cause, cause);
+    }
+
+    private int executeSubmitMaxJob(List<Integer> numbers) throws RemoteException {
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
         int workerCount = Math.min(reachableWorkers.size(), numbers.size());
         if (workerCount == 0) {
@@ -290,12 +440,25 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
+        return runPartialJob(() -> {
+            int partialMax = Collections.max(numbers);
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
+                    + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
+            return partialMax;
+        });
+    }
 
-        int partialMax = Collections.max(numbers);
-        int updatedJac = jobAllocationCounter.incrementAndGet();
-        System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
-                + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
-        return partialMax;
+    /** Runs a worker-side partial computation on the shared job executor. */
+    private int runPartialJob(Callable<Integer> job) throws RemoteException {
+        try {
+            return jobExecutor.submit(job).get();
+        } catch (ExecutionException e) {
+            throw unwrapExecution(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Job interrupted", e);
+        }
     }
 
     @Override
@@ -303,11 +466,13 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
-        if (currentCoordinatorId.get() != workerId) {
-            throw new RemoteException("Worker " + workerId
-                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
-        }
+        requireCoordinator();
 
+        int termSlot = claimTermSlot();
+        return runJob(termSlot, () -> executeSubmitPrimeCount(numbers));
+    }
+
+    private int executeSubmitPrimeCount(List<Integer> numbers) throws RemoteException {
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
         int workerCount = Math.min(reachableWorkers.size(), numbers.size());
         if (workerCount == 0) {
@@ -353,21 +518,21 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         if (numbers == null) {
             throw new IllegalArgumentException("numbers must not be null");
         }
-
-        int count = 0;
-        for (Integer value : numbers) {
-            if (value == null) {
+        return runPartialJob(() -> {
+            if (numbers.contains(null)) {
                 throw new IllegalArgumentException("numbers must not contain null values");
             }
-            if (isPrime(value)) {
-                count++;
+            int count = 0;
+            for (Integer value : numbers) {
+                if (isPrime(value)) {
+                    count++;
+                }
             }
-        }
-
-        int updatedJac = jobAllocationCounter.incrementAndGet();
-        System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
-                + numbers + ", primes=" + count + ", JAC=" + updatedJac);
-        return count;
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
+                    + numbers + ", primes=" + count + ", JAC=" + updatedJac);
+            return count;
+        });
     }
 
     private static boolean isPrime(int number) {
