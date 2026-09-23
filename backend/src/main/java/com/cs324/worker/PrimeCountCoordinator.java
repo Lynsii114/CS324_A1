@@ -26,6 +26,13 @@ public final class PrimeCountCoordinator {
         }
 
         int workerCount = workers.size();
+        // The first active worker coordinates this request. Its own local
+        // section is not an allocation; each remote section is one assignment.
+        WorkerInfo coordinatorInfo = workers.get(0);
+        Registry coordinatorRegistry = LocateRegistry.getRegistry(
+                coordinatorInfo.getHost(), coordinatorInfo.getPort());
+        WorkerService coordinator = (WorkerService) coordinatorRegistry.lookup(
+                WorkerServer.SERVICE_NAME_PREFIX + coordinatorInfo.getWorkerId());
         int baseSize = numbers.size() / workerCount;
         int remainder = numbers.size() % workerCount;
         int offset = 0;
@@ -36,6 +43,9 @@ public final class PrimeCountCoordinator {
             offset += sectionSize;
 
             WorkerInfo info = workers.get(i);
+            if (info.getWorkerId() != coordinatorInfo.getWorkerId()) {
+                coordinator.recordJobAllocation();
+            }
             Registry registry = LocateRegistry.getRegistry(info.getHost(), info.getPort());
             WorkerService worker = (WorkerService) registry.lookup(
                     WorkerServer.SERVICE_NAME_PREFIX + info.getWorkerId());

@@ -37,6 +37,14 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
+    public int recordJobAllocation() throws RemoteException {
+        int updated = jobAllocationCounter.incrementAndGet();
+        System.out.println("Worker Node " + workerId + " JAC changed to " + updated
+                + " (assigned a job to another worker)");
+        return updated;
+    }
+
+    @Override
     public List<Integer> getNeighbours() throws RemoteException {
         return new ArrayList<>(neighbours);
     }

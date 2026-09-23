@@ -14,6 +14,9 @@ public interface WorkerService extends Remote {
 
     int getJobAllocationCounter() throws RemoteException;
 
+    /** Records one job assigned by this worker while it is coordinator. */
+    int recordJobAllocation() throws RemoteException;
+
     List<Integer> getNeighbours() throws RemoteException;
 
     void addNeighbour(int workerId) throws RemoteException;
