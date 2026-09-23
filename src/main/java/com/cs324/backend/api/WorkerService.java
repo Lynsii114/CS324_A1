@@ -85,4 +85,14 @@ public interface WorkerService extends Remote {
 
     /** Computes the number of primes in a section assigned by the coordinator. */
     int countPrimes(List<Integer> numbers) throws RemoteException;
+
+    /**
+     * Distributes a PRIMESUM job across reachable workers. Coordinator only.
+     * Returns the sum of all prime numbers in the inclusive range
+     * {@code [start, end]}.
+     */
+    long submitPrimeSum(int start, int end) throws RemoteException;
+
+    /** Computes the sum of the primes in the inclusive range assigned by the coordinator. */
+    long sumPrimeRange(int start, int end) throws RemoteException;
 }

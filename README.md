@@ -361,6 +361,63 @@ Look for these console messages:
   `PRIMECOUNT partial result`, and `PRIMECOUNT final result`
 - Worker terminals: `PRIMECOUNT partial compute`
 
+### Test Distributed PRIMESUM Job
+
+With the six workers running and a coordinator elected (worker `6` with default
+tie-breaking), send a PRIMESUM job to worker `6`:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.PrimeSumClientTest
+```
+
+This computes the sum of all prime numbers in the range `[1, 600]`. The
+coordinator divides the range into as many contiguous sub-ranges as there are
+reachable workers, e.g.:
+
+```text
+PRIMESUM(1, 600)
+W1 → 1–100
+W2 → 101–200
+W3 → 201–300
+W4 → 301–400
+W5 → 401–500
+W6 → 501–600
+```
+
+To provide your own range:
+
+```powershell
+java -cp target/classes com.cs324.frontend.client.PrimeSumClientTest localhost 5006 6 100 300
+```
+
+Expected flow:
+
+```text
+Client
+    ↓
+Coordinator receives PRIMESUM(start, end)
+    ↓
+Coordinator finds reachable workers
+    ↓
+Coordinator divides the range as evenly as possible
+    ↓
+Each worker sums the primes in its contiguous sub-range
+    ↓
+Coordinator adds the partial sums
+    ↓
+Client receives the total prime sum
+```
+
+Look for these console messages:
+
+- Client terminal: `[Client] Sending PRIMESUM job` and `[Client] PRIMESUM result`
+- Coordinator terminal: `PRIMESUM job received`, `PRIMESUM assigning`,
+  `PRIMESUM partial result`, and `PRIMESUM final result`
+- Worker terminals: `PRIMESUM partial compute`
+
+A PRIMESUM job also spends one of the coordinator's five per-term job slots,
+exactly like MAX and PRIMECOUNT (see the 5-Job Coordinator Term section).
+
 #### Step 6 - Monitor or stop the workers
 
 Check which worker processes are alive:
