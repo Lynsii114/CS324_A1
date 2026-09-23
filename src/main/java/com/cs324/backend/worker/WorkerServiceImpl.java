@@ -91,6 +91,14 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
+    public int recordJobAllocation() throws RemoteException {
+        int updated = jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] JAC changed to " + updated
+                + " (assigned a job section to another worker)");
+        return updated;
+    }
+
+    @Override
     public int resetJobAllocationCounter() throws RemoteException {
         jobAllocationCounter.set(0);
         return jobAllocationCounter.get();
@@ -252,6 +260,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
             WorkerService worker = reachableWorkers.get(index);
             int assignedWorkerId = worker.getWorkerId();
+
+            if (assignedWorkerId != workerId) {
+                recordJobAllocation();
+            }
 
             try {
                 System.out.println("[Worker " + workerId + "] MAX assigning -> toWorkerId="

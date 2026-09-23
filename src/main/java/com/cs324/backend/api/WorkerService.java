@@ -20,6 +20,13 @@ public interface WorkerService extends Remote {
     /** Increases the Job Acceptance Counter (JAC) of this worker by one. */
     int incrementJobAllocationCounter() throws RemoteException;
 
+    /**
+     * Records one job allocation made by this worker while it is coordinator.
+     * Used when the coordinator delegates a section of a distributed job to
+     * another worker.
+     */
+    int recordJobAllocation() throws RemoteException;
+
     int resetJobAllocationCounter() throws RemoteException;
 
     List<WorkerInfo> getNeighbours() throws RemoteException;

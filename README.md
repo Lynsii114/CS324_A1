@@ -433,6 +433,26 @@ lowest JAC and the tie is broken by the highest worker ID:
 Election result: Coordinator elected: worker 5 (JAC=0) across 6 reachable workers [electionId=...]
 ```
 
+### Coordinator Job-Allocation Tracking (JAC)
+
+While a worker is coordinator, every section it delegates to another worker is a
+job allocation: the coordinator's Job Acceptance Counter (JAC) is incremented
+for each remote assignment via `recordJobAllocation()`. The coordinator's own
+section is not counted as an allocation.
+
+During a MAX job, each delegated remote section increments the coordinator's
+JAC. Look for these messages on the coordinator terminal:
+
+```text
+[Worker 6] JAC changed to 1 (assigned a job section to another worker)
+[Worker 6] JAC changed to 2 (assigned a job section to another worker)
+```
+
+Because elections prefer the worker with the lowest JAC, JAC growth directly
+influences future leadership: after a coordinator has delegated enough work,
+`reset` the coordinators and run a new election to let lower-JAC workers
+become coordinator (see the tie-breaking example above).
+
 ### Watching the Election Propagate
 
 Each worker logs its election activity in its own file. During an election you
