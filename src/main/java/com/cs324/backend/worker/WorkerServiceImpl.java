@@ -636,6 +636,16 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 + WorkerService.COORDINATOR_TERM_LIMIT + " jobs this term - ending term "
                 + "and starting a new leader election");
         broadcastTermEnd();
+
+        // Demotion tick: when every worker processed the same number of segments
+        // (e.g. a PRIMECOUNT that always fans out to all six nodes) the tied
+        // election would re-elect the outgoing coordinator forever. Marking the
+        // step-down as +1 JAC keeps the lowest-JAC rule intact while letting the
+        // next term rotate to a least-loaded worker.
+        jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] demotion tick -> JAC is now "
+                + jobAllocationCounter.get());
+
         try {
             String result = initiateElection();
             System.out.println("[Worker " + workerId + "] term re-election result: " + result);

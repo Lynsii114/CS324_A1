@@ -84,7 +84,10 @@ The election protocol runs in three phases.
 9. The new coordinator is the reachable worker with the **lowest JAC**; on a tie the **highest
    startup priority id** wins (worker id as a final safety net). The new coordinator's term counter
    resets to 0 and it serves its own 5 jobs (its *own* JAC is never reset — it keeps climbing with
-   the segments it processes).
+   the segments it processes). When a term ends the outgoing coordinator takes a small **demotion
+   tick** (`JAC + 1`) after broadcasting Term_End, so a cluster in which every worker processed the
+   same number of segments (e.g. a PRIMECOUNT that fans out to all six nodes every time) still
+   rotates to a least-loaded worker instead of re-electing the same node forever.
 10. A 6th submission during the hand-over is refused until the new coordinator is announced;
     clients retry automatically against the newly elected coordinator.
 
