@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,12 +52,25 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       the merged participant set back. When all echoes return, every reachable
  *       worker has been discovered.</li>
  *   <li>The winner is the reachable worker with the lowest JAC; ties are broken
- *       by the highest worker id.</li>
+ *       by the highest startup priority id (minted by the Phase-1 timer lottery),
+ *       then the highest worker id as a safety net.</li>
+ *   <li>Phase 1: on a fresh cluster the six workers run a randomized countdown
+ *       (150-300 ms); the first to expire claims priority 6, the next 5, down to
+ *       1. All JACs are still 0, so the priority-6 worker declares itself the
+ *       Initial Coordinator and alerts the other five.</li>
+ *   <li>Phase 2: the coordinator re-splits each incoming task into a variable
+ *       number of contiguous segments (never more than one per worker, sized by
+ *       the input) and hands them to the lowest-JAC workers; every worker that
+ *       processes a segment has its own JAC incremented.</li>
+ *   <li>Phase 3: after 5 submitted jobs the coordinator broadcasts a Term_End
+ *       message with the verified JAC table, steps down, and a new election picks
+ *       the lowest-JAC worker (tie -> highest priority id).</li>
  *   <li>The result is broadcast to all participants as a
  *       {@link WinnerAnnouncement}, so every worker records the same
  *       coordinator.</li>
  *   <li>The Bootstrap Node is never involved beyond looking up the active worker
- *       registry; it does not participate in the election.</li>
+ *       registry and sequencing lottery claims; it does not participate in the
+ *       election.</li>
  * </ul>
  *
  * <p><b>Concurrency strategy (5-job coordinator terms + multithreaded
@@ -101,6 +115,29 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
 
+    /** Startup-lottery priority id (1..6); 6 = highest. Minted at boot by the
+     * randomized countdown lottery and used as the election tie-breaker. */
+    private volatile int priorityId = 0;
+
+    /** Wall-clock time this worker's randomized countdown expires (Phase 1). */
+    private volatile long lotteryFireAt = -1L;
+
+    /** True once the priority-6 worker has declared itself the Initial Coordinator. */
+    private volatile boolean declaredInitial = false;
+
+    /** True once this worker rebuilt its neighbour ring after the lottery completed. */
+    private volatile boolean neighboursSyncedAfterLottery = false;
+
+    /** If the cluster never completes, elections fall back to the active set after this. */
+    private final long lotteryDeadline = System.currentTimeMillis() + LOTTERY_TIMEOUT_MS;
+
+    /**
+     * Drives the Phase-1 startup lottery: a fast poll that only acts after the
+     * cluster is complete, firing each worker's randomized 150-300 ms countdown
+     * and claiming a startup priority from the Bootstrap Node.
+     */
+    private final ScheduledExecutorService lotteryScheduler;
+
     /**
      * Guards against a worker running two elections at once (e.g. its background
      * auto-election check colliding with the re-election that ends a term, or
@@ -137,6 +174,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                     thread.setDaemon(true);
                     return thread;
                 });
+        this.lotteryScheduler = Executors.newSingleThreadScheduledExecutor(
+                runnable -> {
+                    Thread thread = new Thread(runnable, "startup-lottery-" + workerId);
+                    thread.setDaemon(true);
+                    return thread;
+                });
         this.jobExecutor = Executors.newFixedThreadPool(
                 Math.max(WorkerService.COORDINATOR_TERM_LIMIT + 1, Runtime.getRuntime().availableProcessors()),
                 runnable -> {
@@ -153,6 +196,11 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
+    public int getPriorityId() throws RemoteException {
+        return priorityId;
+    }
+
+    @Override
     public int getJobAllocationCounter() throws RemoteException {
         return jobAllocationCounter.get();
     }
@@ -166,7 +214,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     public int recordJobAllocation() throws RemoteException {
         int updated = jobAllocationCounter.incrementAndGet();
         System.out.println("[Worker " + workerId + "] JAC changed to " + updated
-                + " (assigned a job section to another worker)");
+                + " (processed a distributed job segment)");
         return updated;
     }
 
@@ -264,7 +312,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
             refreshNeighbours();
 
-            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
+            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), priorityId,
+                    registeredHost, registeredPort);
             String electionId = UUID.randomUUID().toString();
             // The initiator marks its own election as processed so a message that
             // loops back to it is dropped instead of being handled twice.
@@ -311,7 +360,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         try {
             refreshNeighbours();
 
-            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
+            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), priorityId,
+                    registeredHost, registeredPort);
             Set<CandidateInfo> participants = new LinkedHashSet<>(message.getParticipants());
             participants.add(self);
 
@@ -340,15 +390,150 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private static final long WORKER_DELAY_STEP_MS = 2_000;
     private static final long AUTO_ELECTION_PERIOD_MS = 4_000;
 
+    // ---- Phase 1: startup timer lottery (150-300 ms randomized countdown) ----
+    private static final long LOTTERY_MIN_DELAY_MS = 150;
+    private static final int LOTTERY_SPAN_MS = 150;
+    private static final long LOTTERY_POLL_MS = 200;
+    private static final long LOTTERY_TIMEOUT_MS = 20_000;
+
+    // ---- Phase 2: variable task segmentation thresholds ----
+    private static final int SEGMENT_NUMBERS = 3;    // MAX / PRIMECOUNT numbers per segment
+    private static final int SEGMENT_RANGE_LENGTH = 200; // PRIMESUM range length per segment
+
+    @Override
+    public void notifyTermEnd(int priorCoordinatorId, Map<Integer, Integer> finalJacTable) throws RemoteException {
+        System.out.println("[Worker " + workerId + "] received Term_End from coordinator worker "
+                + priorCoordinatorId + " -> final JAC table: " + finalJacTable);
+    }
+
+    /**
+     * Starts the Phase-1 startup lottery: each worker kicks off a randomized
+     * countdown once the cluster is complete; the first to expire claims
+     * startup priority 6, the next 5, and so on down to 1.
+     */
+    public void startStartupLottery() {
+        lotteryScheduler.scheduleWithFixedDelay(this::lotteryTick,
+                LOTTERY_MIN_DELAY_MS, LOTTERY_POLL_MS, TimeUnit.MILLISECONDS);
+        System.out.println("[Worker " + workerId + "] startup lottery started (randomized countdown "
+                + LOTTERY_MIN_DELAY_MS + "-" + (LOTTERY_MIN_DELAY_MS + LOTTERY_SPAN_MS) + " ms)");
+    }
+
+    /**
+     * Fires on the lottery scheduler thread. While this worker has no priority
+     * yet it waits for the cluster to become complete, then runs its randomized
+     * countdown and claims a startup priority (6, 5, ..., 1 by claim order).
+     * After every worker has priority, the priority-6 worker declares itself the
+     * Initial Coordinator and alerts the other workers.
+     */
+    private void lotteryTick() {
+        if (declaredInitial) {
+            return;
+        }
+        try {
+            if (priorityId == 0) {
+                if (lotteryFireAt == -1L) {
+                    long completeTime = readClusterCompleteTime();
+                    boolean fullCluster = readActiveWorkerCount() >= WorkerClusterConfig.WORKER_COUNT;
+                    if (completeTime > 0 && fullCluster) {
+                        lotteryFireAt = completeTime + lotteryCountdown();
+                        System.out.println("[Worker " + workerId + "] lottery countdown -> "
+                                + (lotteryFireAt - System.currentTimeMillis())
+                                + " ms (cluster complete at " + completeTime + ")");
+                    } else if (System.currentTimeMillis() > lotteryDeadline) {
+                        lotteryFireAt = System.currentTimeMillis() + lotteryCountdown();
+                        System.out.println("[Worker " + workerId + "] cluster not complete within "
+                                + LOTTERY_TIMEOUT_MS + " ms - starting a partial startup lottery");
+                    } else {
+                        return;
+                    }
+                }
+                if (System.currentTimeMillis() < lotteryFireAt) {
+                    return;
+                }
+                int assigned = bootstrapService.lotteryClaim(workerId);
+                priorityId = assigned;
+                System.out.println("[Worker " + workerId + "] lottery claim -> startup priority "
+                        + assigned + " (all JACs are 0, so priority 6 starts as Initial Coordinator)");
+            }
+
+            if (priorityId != 0 && isPriorityTableComplete() && !neighboursSyncedAfterLottery) {
+                // The registry is only populated progressively as workers boot, so the
+                // ring built at startup spans a partial neighbour graph. Once every
+                // priority is claimed the full node set is known; rebuild the ring so
+                // Phase-2 distribution and Term_End broadcasts can reach all workers.
+                neighboursSyncedAfterLottery = true;
+                refreshNeighbours();
+                System.out.println("[Worker " + workerId + "] rebuilt neighbour ring for the full cluster "
+                        + "(neighbours=" + neighbours.size() + ")");
+            }
+
+            if (priorityId == WorkerClusterConfig.WORKER_COUNT
+                    && isPriorityTableComplete()
+                    && currentCoordinatorId.get() == NO_COORDINATOR) {
+                declaredInitial = true;
+                recordCoordinator(workerId);
+                System.out.println("[Worker " + workerId + "] priority 6 -> declaring self Initial "
+                        + "Coordinator and alerting the other "
+                        + (WorkerClusterConfig.WORKER_COUNT - 1) + " workers");
+                for (WorkerInfo other : bootstrapService.getActiveWorkers()) {
+                    if (other.getWorkerId() == workerId) {
+                        continue;
+                    }
+                    WorkerService remote = lookupWorker(other);
+                    if (remote != null) {
+                        remote.setCurrentCoordinatorId(workerId);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[Worker " + workerId + "] lottery check failed: " + e.getMessage());
+        }
+    }
+
+    private static long lotteryCountdown() {
+        return LOTTERY_MIN_DELAY_MS + ThreadLocalRandom.current().nextInt(LOTTERY_SPAN_MS + 1);
+    }
+
+    private long readClusterCompleteTime() {
+        try {
+            return bootstrapService.getClusterCompleteTime();
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    private int readActiveWorkerCount() {
+        try {
+            return bootstrapService.getActiveWorkers().size();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private boolean isPriorityTableComplete() {
+        try {
+            return bootstrapService.getPriorityTable().size() >= WorkerClusterConfig.WORKER_COUNT;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     /**
      * Fires on the scheduler thread. If the cluster currently has no coordinator
      * and this worker is not taking part in another election, it quietly starts
      * one. Once a coordinator exists the check does nothing, so a healthy cluster
-     * never re-elects.
+     * never re-elects. Elections wait until the startup lottery has assigned a
+     * priority to this worker and (while the cluster is healthy) to every worker.
      */
     private void autoElectionTick() {
         if (currentCoordinatorId.get() != NO_COORDINATOR || electionInProgress.get()) {
             return;
+        }
+        if (priorityId <= 0) {
+            return; // startup lottery has not minted this worker's priority yet
+        }
+        if (System.currentTimeMillis() < lotteryDeadline && !isPriorityTableComplete()) {
+            return; // Phase 1 still running: some worker has not claimed a priority
         }
         try {
             String result = initiateElection();
@@ -450,11 +635,43 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         System.out.println("[Worker " + workerId + "] completed "
                 + WorkerService.COORDINATOR_TERM_LIMIT + " jobs this term - ending term "
                 + "and starting a new leader election");
+        broadcastTermEnd();
         try {
             String result = initiateElection();
             System.out.println("[Worker " + workerId + "] term re-election result: " + result);
         } catch (RemoteException e) {
             System.err.println("[Worker " + workerId + "] term re-election failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Phase-3 step-down protocol: before dropping to a worker role, the
+     * coordinator pauses incoming traffic (the term counter is at its limit, so
+     * further submissions are refused) and broadcasts a Term_End message with
+     * the final verified JAC table to every reachable worker.
+     */
+    private void broadcastTermEnd() {
+        try {
+            List<WorkerService> reachable = getReachableWorkerServices();
+            Map<Integer, Integer> jacTable = new HashMap<>();
+            for (WorkerService worker : reachable) {
+                jacTable.put(readWorkerId(worker), readJAC(worker));
+            }
+            System.out.println("[Worker " + workerId + "] Term_End broadcast -> final JAC table: " + jacTable);
+            for (WorkerService worker : reachable) {
+                int targetId = readWorkerId(worker);
+                if (targetId == workerId) {
+                    continue;
+                }
+                try {
+                    worker.notifyTermEnd(workerId, jacTable);
+                } catch (RemoteException e) {
+                    System.err.println("[Worker " + workerId + "] could not deliver Term_End to worker "
+                            + targetId + ": " + e.getMessage());
+                }
+            }
+        } catch (RemoteException e) {
+            System.err.println("[Worker " + workerId + "] Term_End broadcast failed: " + e.getMessage());
         }
     }
 
@@ -468,40 +685,40 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     private int executeSubmitMaxJob(List<Integer> numbers) throws RemoteException {
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int workerCount = Math.min(reachableWorkers.size(), numbers.size());
-        if (workerCount == 0) {
+        int segmentCount = segmentCountFor(reachableWorkers.size(), numbers.size(), SEGMENT_NUMBERS);
+        if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for MAX job");
         }
 
         System.out.println("[Worker " + workerId + "] MAX job received -> numbers="
                 + numbers + ", reachableWorkers=" + reachableWorkers.size()
-                + ", assignedWorkers=" + workerCount);
+                + ", segments=" + segmentCount);
 
         int finalMax = Integer.MIN_VALUE;
         int start = 0;
-        for (int index = 0; index < workerCount; index++) {
+        for (int index = 0; index < segmentCount; index++) {
             int remainingNumbers = numbers.size() - start;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            int remainingSegments = segmentCount - index;
+            int chunkSize = (remainingNumbers + remainingSegments - 1) / remainingSegments;
             List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
             WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
+            int targetId = readWorkerId(worker);
 
-            if (assignedWorkerId != workerId) {
-                recordJobAllocation();
-            }
+            // Phase 2 JAC tracking: the worker chosen to process this segment
+            // has its own local JAC incremented by the coordinator.
+            worker.recordJobAllocation();
 
             try {
                 System.out.println("[Worker " + workerId + "] MAX assigning -> toWorkerId="
-                        + assignedWorkerId + ", section=" + chunk);
+                        + targetId + ", section=" + chunk);
                 int partialMax = worker.computePartialMax(chunk);
                 finalMax = Math.max(finalMax, partialMax);
                 System.out.println("[Worker " + workerId + "] MAX partial result <- fromWorkerId="
-                        + assignedWorkerId + ", partialMax=" + partialMax
+                        + targetId + ", partialMax=" + partialMax
                         + ", currentFinalMax=" + finalMax);
             } catch (Exception e) {
                 throw new RemoteException("MAX job failed while assigning worker "
-                        + assignedWorkerId, e);
+                        + targetId, e);
             }
 
             start += chunkSize;
@@ -549,40 +766,40 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     private int executeSubmitPrimeCount(List<Integer> numbers) throws RemoteException {
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int workerCount = Math.min(reachableWorkers.size(), numbers.size());
-        if (workerCount == 0) {
+        int segmentCount = segmentCountFor(reachableWorkers.size(), numbers.size(), SEGMENT_NUMBERS);
+        if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for PRIMECOUNT job");
         }
 
         System.out.println("[Worker " + workerId + "] PRIMECOUNT job received -> numbers="
                 + numbers + ", reachableWorkers=" + reachableWorkers.size()
-                + ", assignedWorkers=" + workerCount);
+                + ", segments=" + segmentCount);
 
         int totalPrimes = 0;
         int start = 0;
-        for (int index = 0; index < workerCount; index++) {
+        for (int index = 0; index < segmentCount; index++) {
             int remainingNumbers = numbers.size() - start;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            int remainingSegments = segmentCount - index;
+            int chunkSize = (remainingNumbers + remainingSegments - 1) / remainingSegments;
             List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
             WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
+            int targetId = readWorkerId(worker);
 
-            if (assignedWorkerId != workerId) {
-                recordJobAllocation();
-            }
+            // Phase 2 JAC tracking: the worker chosen to process this segment
+            // has its own local JAC incremented by the coordinator.
+            worker.recordJobAllocation();
 
             try {
                 System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
-                        + assignedWorkerId + ", section=" + chunk);
+                        + targetId + ", section=" + chunk);
                 int partialCount = worker.countPrimes(chunk);
                 totalPrimes += partialCount;
                 System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
-                        + assignedWorkerId + ", primes=" + partialCount
+                        + targetId + ", primes=" + partialCount
                         + ", runningTotal=" + totalPrimes);
             } catch (Exception e) {
                 throw new RemoteException("PRIMECOUNT job failed while assigning worker "
-                        + assignedWorkerId, e);
+                        + targetId, e);
             }
 
             start += chunkSize;
@@ -626,40 +843,40 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     private long executeSubmitPrimeSum(int start, int end) throws RemoteException {
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int workerCount = Math.min(reachableWorkers.size(), end - start + 1);
-        if (workerCount == 0) {
+        int segmentCount = segmentCountFor(reachableWorkers.size(), end - start + 1, SEGMENT_RANGE_LENGTH);
+        if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for PRIMESUM job");
         }
 
         System.out.println("[Worker " + workerId + "] PRIMESUM job received -> start=" + start
                 + ", end=" + end + ", reachableWorkers=" + reachableWorkers.size()
-                + ", assignedWorkers=" + workerCount);
+                + ", segments=" + segmentCount);
 
         long totalSum = 0;
         int segmentStart = start;
-        for (int index = 0; index < workerCount; index++) {
+        for (int index = 0; index < segmentCount; index++) {
             int remainingLength = end - segmentStart + 1;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingLength + remainingWorkers - 1) / remainingWorkers;
+            int remainingSegments = segmentCount - index;
+            int chunkSize = (remainingLength + remainingSegments - 1) / remainingSegments;
             int segmentEnd = segmentStart + chunkSize - 1;
 
             WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
+            int targetId = readWorkerId(worker);
 
-            if (assignedWorkerId != workerId) {
-                recordJobAllocation();
-            }
+            // Phase 2 JAC tracking: the worker chosen to process this segment
+            // has its own local JAC incremented by the coordinator.
+            worker.recordJobAllocation();
 
             try {
                 System.out.println("[Worker " + workerId + "] PRIMESUM assigning -> toWorkerId="
-                        + assignedWorkerId + ", range=[" + segmentStart + ", " + segmentEnd + "]");
+                        + targetId + ", range=[" + segmentStart + ", " + segmentEnd + "]");
                 long partialSum = worker.sumPrimeRange(segmentStart, segmentEnd);
                 totalSum += partialSum;
                 System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
-                        + assignedWorkerId + ", sum=" + partialSum + ", runningTotal=" + totalSum);
+                        + targetId + ", sum=" + partialSum + ", runningTotal=" + totalSum);
             } catch (Exception e) {
                 throw new RemoteException("PRIMESUM job failed while assigning worker "
-                        + assignedWorkerId, e);
+                        + targetId, e);
             }
 
             segmentStart = segmentEnd + 1;
@@ -734,11 +951,14 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     /**
-     * Winner selection: lowest JAC wins; ties are broken by the highest worker id.
+     * Winner selection (Phase 3): the worker with the lowest JAC wins; ties are
+     * broken by the highest startup priority id (Phase 1 lottery), then the
+     * highest worker id as a final safety tie-break.
      */
     private CandidateInfo selectWinner(Collection<CandidateInfo> candidates) {
         return candidates.stream()
                 .min(Comparator.comparingInt(CandidateInfo::getJac)
+                        .thenComparing(Comparator.comparingInt(CandidateInfo::getPriorityId).reversed())
                         .thenComparing(Comparator.comparingInt(CandidateInfo::getWorkerId).reversed()))
                 .orElseThrow(() -> new IllegalStateException("election produced no candidates"));
     }
@@ -813,6 +1033,19 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         }
     }
 
+    /**
+     * Phase-2 variable segmentation: a task is split into {@code ceil(items /
+     * perSegment)} contiguous segments, capped at the number of active workers
+     * (never more than once chunk of the given size per worker). Because task
+     * sizes fluctuate, one task may spread over 4 workers, the next over 2, etc.
+     */
+    private static int segmentCountFor(int activeWorkers, int totalItems, int perSegment) {
+        if (totalItems <= 0) {
+            return 0;
+        }
+        return Math.max(1, Math.min(activeWorkers, (totalItems + perSegment - 1) / perSegment));
+    }
+
     private List<WorkerService> getReachableWorkerServices() throws RemoteException {
         if (bootstrapService == null) {
             return Collections.singletonList(this);
@@ -860,12 +1093,23 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 jacByWorker.put(reachableWorkerId, readJAC(service));
             }
         }
-        // Distribute work to the least-loaded workers first: ascending JAC,
-        // then ascending worker id as a stable tie-break.
+        // Phase 2 targeting: sort the least-loaded workers first (ascending JAC,
+        // then descending startup priority, then ascending worker id), so the
+        // coordinator hands each segment to the lowest-JAC nodes to keep the
+        // cluster evenly balanced.
         services.sort(Comparator
                 .comparingInt((WorkerService s) -> jacByWorker.getOrDefault(readWorkerId(s), Integer.MAX_VALUE))
-                .thenComparingInt(s -> readWorkerId(s)));
+                .thenComparing(Comparator.comparingInt((WorkerService s) -> readPriority(s)).reversed())
+                .thenComparingInt((WorkerService s) -> readWorkerId(s)));
         return services;
+    }
+
+    private int readPriority(WorkerService service) {
+        try {
+            return service.getPriorityId();
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     private int readJAC(WorkerService service) {
@@ -911,6 +1155,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     public String toString() {
         return "WorkerServiceImpl{"
                 + "workerId=" + workerId
+                + ", priorityId=" + priorityId
                 + ", jobAllocationCounter=" + jobAllocationCounter.get()
                 + ", neighbours=" + neighbours
                 + ", currentCoordinatorId=" + currentCoordinatorId.get()

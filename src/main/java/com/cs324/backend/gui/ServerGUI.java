@@ -55,7 +55,7 @@ import java.util.concurrent.Executors;
  */
 public class ServerGUI extends JFrame {
 
-    private static final String[] COLUMNS = {"Worker", "Port", "Online", "JAC", "JobsThisTerm", "Coordinator", "Neighbours", "Leaderman"};
+    private static final String[] COLUMNS = {"Worker", "Priority", "Port", "Online", "JAC", "JobsThisTerm", "Coordinator", "Neighbours", "Leaderman"};
 
     private final JTextField hostField = new JTextField(WorkerClusterConfig.DEFAULT_HOST, 10);
     private final JTextField bootstrapPortField = new JTextField(String.valueOf(BootstrapServer.DEFAULT_PORT), 6);
@@ -359,6 +359,7 @@ public class ServerGUI extends JFrame {
                 coordinators.add(coordinator);
                 rows.add(new Object[]{
                         worker.getWorkerId(),
+                        priorityText(worker.getPriorityId()),
                         WorkerClusterConfig.portFor(workerId),
                         "yes",
                         worker.getJobAllocationCounter(),
@@ -368,7 +369,8 @@ public class ServerGUI extends JFrame {
                         worker.getLeaderman()});
                 reachable++;
             } catch (Exception e) {
-                rows.add(new Object[]{workerId, WorkerClusterConfig.portFor(workerId), "no", "-", "-", "-", "-", "-"});
+                rows.add(new Object[]{workerId, priorityText(0), WorkerClusterConfig.portFor(workerId),
+                        "no", "-", "-", "-", "-", "-"});
             }
         }
 
@@ -440,6 +442,11 @@ public class ServerGUI extends JFrame {
         } catch (NumberFormatException e) {
             appendError("Bootstrap port must be a number");
         }
+    }
+
+    /** Startup-lottery priority (1..6), or a placeholder while the lottery runs. */
+    private static String priorityText(int priorityId) {
+        return priorityId > 0 ? String.valueOf(priorityId) : "-";
     }
 
     private WorkerService lookupWorker(int workerId) throws Exception {

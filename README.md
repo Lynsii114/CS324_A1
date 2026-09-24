@@ -5,9 +5,10 @@
 This project is a distributed computing cluster built with **Java RMI**. These are **six independent worker processes** connected in an unstructured network, a neutral
 **Bootstrap Node** tracking membership, and a distributed **leader election** that lets the
 workers agree on a **Coordinator** for one term at a time. Clients submit jobs (MAX, PRIMECOUNT,
-PRIMESUM); the coordinator splits the work evenly across all reachable active workers, RANKING the
-workers by **JAC** (lowest first) so the least-loaded nodes get work first, merges the partial
-results and returns the final answer.
+PRIMESUM); the coordinator re-splits the work into a **variable number of contiguous segments**
+(based on the task size) and RANKS the workers by **JAC** (lowest first) so the least-loaded nodes
+get work first — each worker that processes a segment has its own JAC incremented — merges the
+partial results and returns the final answer.
 
 Each worker runs in its own JVM with its own RMI registry port, its own log file and its own
 pid file. Workers only know their direct neighbours (a ring backbone built from the Bootstrap
@@ -34,48 +35,68 @@ hop-by-hop over the neighbour graph.
 
 ### Component Responsibilities
 
-- **Bootstrap Node** — only tracks active workers; it never runs jobs and never participates in
-  elections. Exposes `registerWorker`, `unregisterWorker`, `getActiveWorkers`, `getRandomWorker`.
-- **Worker** — registers with the Bootstrap Node, maintains neighbours, participates in elections
-  and runs distributed computations. Tracks a lifetime **JAC** (jobs allocated) and a per-term
-  submitted-job counter.
+- **Bootstrap Node** — only tracks active workers and sequences startup-lottery claims; it never
+  runs jobs and never participates in elections. Exposes `registerWorker`, `unregisterWorker`,
+  `getActiveWorkers`, `getRandomWorker`, `lotteryClaim`, `getPriorityTable`.
+- **Worker** — registers with the Bootstrap Node, maintains neighbours, participates in the
+  startup lottery and in elections, and runs distributed computations. Tracks a lifetime **JAC**
+  (segments processed) and a per-term submitted-job counter.
 - **Coordinator** — a worker elected for one term. Receives jobs from clients, finds reachable
-  active workers, divides work evenly, sends sub-jobs, combines partial results, assigns at most
-  **five jobs per term**, then steps down and triggers the next election.
+  active workers, splits each task into segments of a fixed maximum size, hands them to the
+  lowest-JAC workers (incrementing the receiving worker's JAC), combines partial results, assigns
+  at most **five jobs per term**, then broadcasts Term_End and steps down.
 - **Client** — a separate process with a GUI that accepts manual or CSV input and submits jobs
   concurrently.
 
 ---
 
-## Election & Tie-Breaking Rules
+## Election, Startup Lottery & Tie-Breaking Rules
 
-1. Any worker can initiate an election while no coordinator is present.
-2. Every worker runs a small background check (staggered per worker) and quietly starts an
-   election when the cluster has no coordinator. This is automatic: a freshly started cluster
-   elects by itself, and a cluster whose 5-job term ends re-elects itself — no manual trigger is
-   needed.
-3. An `ElectionMessage` (unique `electionId`) floods the neighbour graph; each worker processes a
-   given election id **at most once** (duplicates are dropped), so cycles cannot loop forever.
-   A per-worker `electionInProgress` guard stops a worker from starting its own election while it
-   is participating in another one.
-4. Each participant contributes a `CandidateInfo` (worker id + JAC) snapshot; echoed participant
-   sets are merged back at the initiator, so **every reachable active worker** is considered.
-5. Winner = **lowest JAC**; on a tie the **highest worker ID** wins.
+The election protocol runs in three phases.
 
-**What data drives a fresh-election?** On a brand-new cluster every worker starts with
-`JAC = 0`, so the first election has no JAC signal and the tie-break is used: all six workers tie
-at `0`, so **worker 6** is elected. After each 5-job term the coordinator's own JAC has risen
-(only it assigns sub-jobs to other workers), so the next election picks the lowest-JAC worker —
-a **different** node each term. The coordinator therefore rotates `6 → 5 → 4 → 3 → 2 → 1 → 6 → …`,
-and the rotation is always a *consequence* of the JAC values, never a fixed order.
+### Phase 1 — Startup & Initial Leader Election (Timer Lottery)
 
-6. The winner is broadcast to all participants and every worker records the same coordinator.
+1. All six workers boot with `JAC = 0` and no coordinator.
+2. When the Bootstrap Node reports the cluster complete (6/6 registered), every worker starts a
+   **randomized countdown of 150–300 ms**.
+3. The first worker whose countdown expires claims **startup priority 6**, the second claims
+   **priority 5**, … the last claims **priority 1**. The Bootstrap Node sequences the claims, so
+   every cold start produces priority ids `1..6` in a random assignment.
+4. The worker holding **priority 6** declares itself the **Initial Coordinator** and alerts the
+   other five; all empty JACs mean there is no better signal, so the lottery winner leads.
 
-**Coordinator term:** a coordinator handles at most 5 submitted client jobs per term
-(`jobsThisTerm`, separate from the lifetime JAC). Immediately after the 5th job completes it
-demotes itself (`NO_COORDINATOR`) and starts a fresh election. A 6th submission during the
-hand-over is refused until the new coordinator is announced; clients retry automatically against
-the newly elected coordinator.
+### Phase 2 — Dynamic Segmented Task Distribution
+
+5. Reachable workers are ranked by **JAC (ascending)** — least-loaded first — then by
+   startup priority (descending), then worker id.
+6. Each submitted task is split into a **variable number of contiguous segments**:
+   `max(1, min(activeWorkers, ⌈items / maxItemsPerSegment⌉))`. A large PRIMESUM spreads over many
+   workers, a small one over one or two — segment counts differ from task to task.
+7. Each segment is handed to the lowest-JAC worker, and **that worker's own JAC is incremented**
+   (including for a segment the coordinator keeps itself). The coordinator can therefore process
+   several clients concurrently, and the JAC values diverge naturally with workload.
+
+### Phase 3 — Term Expiration & Lowest-JAC Re-Election
+
+8. A coordinator serves **at most 5 submitted client jobs** per term (`jobsThisTerm`). Immediately
+   after the 5th job it pauses, broadcasts **Term_End** containing its verified final JAC table,
+   demotes itself to `NO_COORDINATOR`, and starts a fresh election.
+9. The new coordinator is the reachable worker with the **lowest JAC**; on a tie the **highest
+   startup priority id** wins (worker id as a final safety net). The new coordinator's term counter
+   resets to 0 and it serves its own 5 jobs (its *own* JAC is never reset — it keeps climbing with
+   the segments it processes).
+10. A 6th submission during the hand-over is refused until the new coordinator is announced;
+    clients retry automatically against the newly elected coordinator.
+
+**Election mechanics (used from Phase 3 onward, and as a fallback whenever no coordinator is
+present):** any worker can initiate an election; the fixed background check runs quietly and
+starts one when the cluster has no coordinator. An `ElectionMessage` (unique `electionId`) floods
+the neighbour graph; each worker processes a given election id **at most once** (duplicates are
+dropped), and a per-worker `electionInProgress` guard stops a worker from starting its own election
+while it is participating in another one. Each participant contributes a `CandidateInfo` (worker id
++ priority id + JAC) snapshot; echoed participant sets are merged back at the initiator, so every
+reachable active worker is considered. The winner is broadcast to all participants and every worker
+records the same coordinator.
 
 ---
 
@@ -139,11 +160,12 @@ via pid files).
 
 ### 4. Wait for the automatic election
 
-There is **no election button** — the workers elect a coordinator by themselves. Within ~10
-seconds the dashboard shows `Election: COMPLETE` and **Elected Coordinator: Worker 6** (on a fresh
-cluster all JACs are `0`, so the tie-break — highest worker ID — elects worker 6). The log line
-`Election complete -> coordinator is worker 6` confirms it. After each 5-job term a new election
-runs automatically and a different worker (lowest JAC) takes over.
+There is **no election button** — the six workers run a startup timer lottery and elect a
+coordinator by themselves. Within ~10 seconds the dashboard shows `Election: COMPLETE` and
+**Elected Coordinator: Worker N**. The worker whose 150–300 ms countdown expired first claimed
+priority 6 and declared itself the Initial Coordinator (all JACs are 0 at boot). The Startup
+Lottery column shows the minted priority per worker. After each 5-job term the coordinator
+broadcasts Term_End with its final JAC table and a lowest-JAC election runs automatically.
 
 ### 5. Launch one or more Clients
 
@@ -219,11 +241,12 @@ java -cp target/classes com.cs324.frontend.client.ClientGUI
 Malformed values (non-numeric, empty, `start > end`, `start < 1`) produce a clear error in the
 task table instead of crashing.
 
-The coordinator divides the input as evenly as possible across the reachable workers
-(`base = n / w`, the first `n % w` workers get one extra item), ranking workers by **JAC** so the
-least-loaded workers receive their slice first, e.g. a fresh `PRIMESUM(1, 1000)` on six workers
-splits into contiguous ranges `w1:1-167  w2:168-334  …  w6:835-1000`. Partial results are merged
-back at the coordinator, which returns the final answer to the requesting client.
+The coordinator splits each task into a **variable number of contiguous segments** for the
+reachable workers — MAX/PRIMECOUNT use `⌈n / 3⌉` segments, PRIMESUM uses `⌈range / 200⌉` —
+ranking workers by **JAC** (least-loaded first) and incrementing the receiving worker's JAC for
+each segment. A fresh `PRIMESUM(1, 1000)` therefore splits into five ranges of ~200 numbers and a
+10-number MAX into four groups. Partial results are merged back at the coordinator, which returns
+the final answer to the requesting client.
 
 ### Ready-made sample CSV files
 
