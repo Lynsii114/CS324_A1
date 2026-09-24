@@ -240,6 +240,19 @@ task table instead of crashing.
 The coordinator divides the input as evenly as possible across the reachable workers
 (`base = n / w`, the first `n % w` workers get one extra item) and combines the partial results.
 
+### Ready-made sample CSV files
+
+The project ships sample files in the `csv/` folder — open the client GUI, pick the matching job
+type, press **Load CSV...**, choose a file and press **Submit**.
+
+| File | Job type | Contents | Expected result |
+|------|----------|----------|-----------------|
+| `csv/max.csv` | `MAX` | `12,5,99,2,17,45,8,76,31,50,3,88` | `99` |
+| `csv/max-small.csv` | `MAX` | `7,3,21,14,9,1,42` | `42` |
+| `csv/primecount.csv` | `PRIMECOUNT` | `2,6,11,15,17,20,23,29,31,40,47,53,60,67,71,80` | `10` |
+| `csv/primesum.csv` | `PRIMESUM` | `1,1000` | `76127` |
+| `csv/primesum-range.csv` | `PRIMESUM` | `100,600` | `28236` |
+
 ---
 
 ## Observing Internals
