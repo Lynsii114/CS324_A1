@@ -62,4 +62,12 @@ public interface WorkerService extends Remote {
     int submitMaxJob(List<Integer> numbers) throws RemoteException;
 
     int computePartialMax(List<Integer> numbers) throws RemoteException;
+
+    long submitPrimeSumJob(List<Integer> numbers) throws RemoteException;
+
+    long computePartialPrimeSum(List<Integer> numbers) throws RemoteException;
+
+    int submitPrimeCountJob(List<Integer> numbers) throws RemoteException;
+
+    int computePartialPrimeCount(List<Integer> numbers) throws RemoteException;
 }

@@ -45,9 +45,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       worker has been discovered.</li>
  *   <li>The winner is the reachable worker with the lowest JAC; ties are broken
  *       by the highest worker id.</li>
- *   <li>The result is broadcast to all participants as a
- *       {@link WinnerAnnouncement}, so every worker records the same
- *       coordinator.</li>
+ *   <li>The result is propagated through the worker network as a COORDINATOR
+ *       {@link WinnerAnnouncement}. Each worker records it once and forwards it
+ *       to its neighbours, so reachable workers agree on the same coordinator.</li>
  *   <li>The Bootstrap Node is never involved beyond looking up the active worker
  *       registry; it does not participate in the election.</li>
  * </ul>
@@ -63,6 +63,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final AtomicInteger jobAllocationCounter = new AtomicInteger(0);
     private final AtomicInteger currentCoordinatorId = new AtomicInteger(NO_COORDINATOR);
     private final Set<String> processedElectionIds = ConcurrentHashMap.newKeySet();
+    private final Set<String> processedCoordinatorIds = ConcurrentHashMap.newKeySet();
     private final Set<WorkerInfo> neighbours = ConcurrentHashMap.newKeySet();
     private final String leaderman = "cs324";
 
@@ -177,14 +178,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         allParticipants.add(self);
 
         CandidateInfo winner = selectWinner(allParticipants);
-        currentCoordinatorId.set(winner.getWorkerId());
-
         System.out.println("[Worker " + workerId + "] election " + electionId + " winner: worker "
                 + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
                 + allParticipants.size() + " reachable workers");
 
         WinnerAnnouncement announcement = new WinnerAnnouncement(electionId, winner, allParticipants);
-        broadcastWinner(announcement);
+        announceWinner(announcement);
 
         return "Coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
                 + ") across " + allParticipants.size() + " reachable workers [electionId=" + electionId + "]";
@@ -216,11 +215,19 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         if (announcement == null || announcement.getWinner() == null) {
             return;
         }
-        processedElectionIds.add(announcement.getElectionId());
+        if (!processedCoordinatorIds.add(announcement.getElectionId())) {
+            System.out.println("[Worker " + workerId + "] dropping duplicate COORDINATOR message "
+                    + announcement.getElectionId());
+            return;
+        }
+
         currentCoordinatorId.set(announcement.getWinner().getWorkerId());
-        System.out.println("[Worker " + workerId + "] recorded coordinator worker "
+        System.out.println("[Worker " + workerId + "] COORDINATOR received -> worker "
                 + announcement.getWinner().getWorkerId() + " (JAC=" + announcement.getWinner().getJac()
                 + ") for election " + announcement.getElectionId());
+
+        refreshNeighbours();
+        propagateCoordinatorToNeighbours(announcement);
     }
 
     @Override
@@ -286,6 +293,160 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         return partialMax;
     }
 
+    @Override
+    public long submitPrimeSumJob(List<Integer> numbers) throws RemoteException {
+        if (numbers == null || numbers.isEmpty()) {
+            throw new IllegalArgumentException("numbers must not be null or empty");
+        }
+        if (currentCoordinatorId.get() != workerId) {
+            throw new RemoteException("Worker " + workerId
+                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+        }
+
+        List<WorkerService> reachableWorkers = getReachableWorkerServices();
+        int workerCount = Math.min(reachableWorkers.size(), numbers.size());
+        if (workerCount == 0) {
+            throw new RemoteException("No reachable workers are available for PRIMESUM job");
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMESUM job received -> numbers="
+                + numbers + ", reachableWorkers=" + reachableWorkers.size()
+                + ", assignedWorkers=" + workerCount);
+
+        long finalSum = 0L;
+        int start = 0;
+        for (int index = 0; index < workerCount; index++) {
+            int remainingNumbers = numbers.size() - start;
+            int remainingWorkers = workerCount - index;
+            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
+            WorkerService worker = reachableWorkers.get(index);
+            int assignedWorkerId = worker.getWorkerId();
+
+            try {
+                System.out.println("[Worker " + workerId + "] PRIMESUM assigning -> toWorkerId="
+                        + assignedWorkerId + ", section=" + chunk);
+                long partialSum = worker.computePartialPrimeSum(chunk);
+                finalSum += partialSum;
+                System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
+                        + assignedWorkerId + ", partialSum=" + partialSum
+                        + ", currentFinalSum=" + finalSum);
+            } catch (Exception e) {
+                throw new RemoteException("PRIMESUM job failed while assigning worker "
+                        + assignedWorkerId, e);
+            }
+
+            start += chunkSize;
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMESUM final result -> sum=" + finalSum);
+        return finalSum;
+    }
+
+    @Override
+    public long computePartialPrimeSum(List<Integer> numbers) throws RemoteException {
+        if (numbers == null || numbers.isEmpty()) {
+            throw new IllegalArgumentException("numbers must not be null or empty");
+        }
+
+        long partialSum = 0L;
+        for (Integer number : numbers) {
+            if (number != null && isPrime(number)) {
+                partialSum += number;
+            }
+        }
+        int updatedJac = jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] PRIMESUM partial compute -> section="
+                + numbers + ", partialSum=" + partialSum + ", JAC=" + updatedJac);
+        return partialSum;
+    }
+
+    @Override
+    public int submitPrimeCountJob(List<Integer> numbers) throws RemoteException {
+        if (numbers == null || numbers.isEmpty()) {
+            throw new IllegalArgumentException("numbers must not be null or empty");
+        }
+        if (currentCoordinatorId.get() != workerId) {
+            throw new RemoteException("Worker " + workerId
+                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+        }
+
+        List<WorkerService> reachableWorkers = getReachableWorkerServices();
+        int workerCount = Math.min(reachableWorkers.size(), numbers.size());
+        if (workerCount == 0) {
+            throw new RemoteException("No reachable workers are available for PRIMECOUNT job");
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT job received -> numbers="
+                + numbers + ", reachableWorkers=" + reachableWorkers.size()
+                + ", assignedWorkers=" + workerCount);
+
+        int finalCount = 0;
+        int start = 0;
+        for (int index = 0; index < workerCount; index++) {
+            int remainingNumbers = numbers.size() - start;
+            int remainingWorkers = workerCount - index;
+            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
+            WorkerService worker = reachableWorkers.get(index);
+            int assignedWorkerId = worker.getWorkerId();
+
+            try {
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
+                        + assignedWorkerId + ", section=" + chunk);
+                int partialCount = worker.computePartialPrimeCount(chunk);
+                finalCount += partialCount;
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
+                        + assignedWorkerId + ", partialCount=" + partialCount
+                        + ", currentFinalCount=" + finalCount);
+            } catch (Exception e) {
+                throw new RemoteException("PRIMECOUNT job failed while assigning worker "
+                        + assignedWorkerId, e);
+            }
+
+            start += chunkSize;
+        }
+
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT final result -> count=" + finalCount);
+        return finalCount;
+    }
+
+    @Override
+    public int computePartialPrimeCount(List<Integer> numbers) throws RemoteException {
+        if (numbers == null || numbers.isEmpty()) {
+            throw new IllegalArgumentException("numbers must not be null or empty");
+        }
+
+        int partialCount = 0;
+        for (Integer number : numbers) {
+            if (number != null && isPrime(number)) {
+                partialCount++;
+            }
+        }
+        int updatedJac = jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
+                + numbers + ", partialCount=" + partialCount + ", JAC=" + updatedJac);
+        return partialCount;
+    }
+
+    private boolean isPrime(int value) {
+        if (value < 2) {
+            return false;
+        }
+        if (value == 2) {
+            return true;
+        }
+        if (value % 2 == 0) {
+            return false;
+        }
+        for (int divisor = 3; divisor <= value / divisor; divisor += 2) {
+            if (value % divisor == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * Forwards a message to every neighbour except the hop it came from,
      * merging the participant sets of all echo replies. This is what lets an
@@ -324,22 +485,19 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 .orElseThrow(() -> new IllegalStateException("election produced no candidates"));
     }
 
-    private void broadcastWinner(WinnerAnnouncement announcement) {
-        for (CandidateInfo candidate : announcement.getParticipants()) {
-            if (candidate.getWorkerId() == workerId) {
-                continue;
-            }
-            WorkerService remote = lookupWorker(new WorkerInfo(candidate.getWorkerId(),
-                    candidate.getHost(), candidate.getPort()));
+    private void propagateCoordinatorToNeighbours(WinnerAnnouncement announcement) {
+        for (WorkerInfo neighbour : neighbours) {
+            WorkerService remote = lookupWorker(neighbour);
             if (remote == null) {
                 continue;
             }
             try {
                 remote.announceWinner(announcement);
-                System.out.println("[Worker " + workerId + "] winner announced to worker " + candidate.getWorkerId());
+                System.out.println("[Worker " + workerId + "] COORDINATOR forwarding -> worker "
+                        + neighbour.getWorkerId());
             } catch (RemoteException e) {
-                System.err.println("[Worker " + workerId + "] could not announce winner to worker "
-                        + candidate.getWorkerId() + ": " + e.getMessage());
+                System.err.println("[Worker " + workerId + "] COORDINATOR forwarding to worker "
+                        + neighbour.getWorkerId() + " failed: " + e.getMessage());
             }
         }
     }

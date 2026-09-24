@@ -2,7 +2,6 @@ package com.cs324.backend.worker;
 
 import com.cs324.backend.api.BootstrapService;
 import com.cs324.backend.api.WorkerInfo;
-import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
 
 import java.rmi.registry.LocateRegistry;
@@ -40,22 +39,15 @@ public class WorkerServer {
             WorkerServiceImpl worker = new WorkerServiceImpl(workerId, self, bootstrap);
             workerRegistry.rebind(serviceName, worker);
 
-            WorkerInfo neighbourInfo = bootstrap.getRandomWorker();
             bootstrap.registerWorker(self);
-
-            if (neighbourInfo != null) {
-                connectToNeighbour(worker, self, neighbourInfo);
-                System.out.println("Connected to neighbour Worker Node " + neighbourInfo.getWorkerId());
-            }
+            int neighbourCount = worker.syncNeighbours();
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
 
             System.out.println("Worker Node " + workerId + " started on port " + workerPort);
             System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);
             System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
-            if (neighbourInfo == null) {
-                System.out.println("No active workers were available; starting without a neighbour");
-            }
+            System.out.println("Synced " + neighbourCount + " neighbour(s) from active worker registry");
             System.out.println("Initial state: JAC=0, coordinatorId=" + worker.getCurrentCoordinatorId()
                     + " (none), leaderman=" + worker.getLeaderman()
                     + ", neighbours=" + worker.getNeighbours());
@@ -64,16 +56,6 @@ public class WorkerServer {
             e.printStackTrace();
             System.exit(1);
         }
-    }
-
-    private static void connectToNeighbour(WorkerService worker, WorkerInfo self, WorkerInfo neighbourInfo)
-            throws Exception {
-        Registry neighbourRegistry = LocateRegistry.getRegistry(neighbourInfo.getHost(), neighbourInfo.getPort());
-        WorkerService neighbour = (WorkerService) neighbourRegistry.lookup(
-                SERVICE_NAME_PREFIX + neighbourInfo.getWorkerId());
-
-        worker.addNeighbour(neighbourInfo);
-        neighbour.addNeighbour(self);
     }
 
     private static Registry getOrCreateRegistry(int port) throws Exception {
