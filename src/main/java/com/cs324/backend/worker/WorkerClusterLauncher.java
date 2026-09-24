@@ -48,7 +48,7 @@ public final class WorkerClusterLauncher {
         }
     }
 
-    private static void start(String bootstrapHost, int bootstrapPort) throws Exception {
+    public static void start(String bootstrapHost, int bootstrapPort) throws Exception {
         Path logDir = Paths.get(WorkerClusterConfig.LOG_DIR);
         Files.createDirectories(logDir);
 
@@ -136,7 +136,7 @@ public final class WorkerClusterLauncher {
         }
     }
 
-    private static void stop() {
+    public static void stop() {
         int stopped = 0;
         for (int workerId : WorkerClusterConfig.workerIds()) {
             Path pidFile = Paths.get(WorkerClusterConfig.LOG_DIR, pidFileName(workerId));

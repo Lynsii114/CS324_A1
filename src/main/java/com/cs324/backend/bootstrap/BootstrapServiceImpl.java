@@ -21,7 +21,7 @@ public class BootstrapServiceImpl extends UnicastRemoteObject implements Bootstr
     // ConcurrentHashMap gives us thread-safe register/unregister/read without external locking.
     private final Map<Integer, WorkerInfo> activeWorkers = new ConcurrentHashMap<>();
 
-    protected BootstrapServiceImpl() throws RemoteException {
+    public BootstrapServiceImpl() throws RemoteException {
         super();
     }
 
