@@ -1,13 +1,13 @@
 package com.cs324.backend.worker;
 
 /**
- * Central configuration for the four-worker cluster.
- * Worker IDs are 1..4 and each worker owns its own RMI registry port,
+ * Central configuration for the six-worker cluster.
+ * Worker IDs are 1..6 and each worker owns its own RMI registry port,
  * so every worker runs in an isolated environment.
  */
 public final class WorkerClusterConfig {
 
-    public static final int WORKER_COUNT = 4;
+    public static final int WORKER_COUNT = 6;
     public static final int FIRST_WORKER_ID = 1;
     public static final int LAST_WORKER_ID = FIRST_WORKER_ID + WORKER_COUNT - 1;
     public static final int BASE_WORKER_PORT = 5001;
@@ -17,7 +17,7 @@ public final class WorkerClusterConfig {
     private WorkerClusterConfig() {
     }
 
-    /** Returns the configured worker IDs: 1, 2, 3, 4. */
+    /** Returns the configured worker IDs: 1, 2, ..., 6. */
     public static int[] workerIds() {
         int[] ids = new int[WORKER_COUNT];
         for (int i = 0; i < WORKER_COUNT; i++) {
@@ -26,7 +26,7 @@ public final class WorkerClusterConfig {
         return ids;
     }
 
-    /** Maps a worker ID to its dedicated RMI registry port (1 -> 5001 ... 4 -> 5004). */
+    /** Maps a worker ID to its dedicated RMI registry port (1 -> 5001 ... 6 -> 5006). */
     public static int portFor(int workerId) {
         if (workerId < FIRST_WORKER_ID || workerId > LAST_WORKER_ID) {
             throw new IllegalArgumentException(

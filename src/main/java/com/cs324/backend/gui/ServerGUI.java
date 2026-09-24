@@ -45,7 +45,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Server-side GUI. From here the Bootstrap Node and the four worker processes
+ * Server-side GUI. From here the Bootstrap Node and the six worker processes
  * are started and stopped. The workers elect a coordinator automatically in the
  * background, so the operator just watches the dashboard: network online / offline,
  * which worker was elected, and the live per-worker state table.
@@ -64,7 +64,6 @@ public class ServerGUI extends JFrame {
     private final JButton startBootstrapButton = new JButton("Start Bootstrap");
     private final JButton startWorkersButton = new JButton("Start Workers");
     private final JButton stopWorkersButton = new JButton("Stop Workers");
-    private final JButton resetButton = new JButton("Reset Coordinators");
     private final JButton refreshButton = new JButton("Refresh");
 
     // Dashboard widgets.
@@ -108,11 +107,11 @@ public class ServerGUI extends JFrame {
         startBootstrapButton.addActionListener(e -> startBootstrap());
         startWorkersButton.addActionListener(e -> startWorkers());
         stopWorkersButton.addActionListener(e -> stopWorkers());
-        resetButton.addActionListener(e -> resetCoordinators());
         refreshButton.addActionListener(e -> refreshStatus());
 
         log("Server manager ready. Start the Bootstrap Node, then start the workers - "
-                + "they elect a coordinator automatically, no manual trigger needed.");
+                + "they elect a coordinator automatically (lowest JAC wins, ties go to the "
+                + "highest worker ID), no manual trigger needed.");
 
         Timer timer = new Timer(2500, e -> refreshBackground());
         timer.start();
@@ -122,7 +121,7 @@ public class ServerGUI extends JFrame {
         getContentPane().setBackground(UITheme.BACKGROUND);
         UITheme.label(bootstrapStatus, UITheme.MUTED);
         for (JButton button : new JButton[]{startBootstrapButton, startWorkersButton,
-                stopWorkersButton, resetButton, refreshButton}) {
+                stopWorkersButton, refreshButton}) {
             UITheme.button(button);
         }
         UITheme.textField(hostField);
@@ -171,7 +170,7 @@ public class ServerGUI extends JFrame {
         JLabel title = new JLabel("Cluster Server Manager");
         title.setFont(UITheme.TITLE);
         title.setForeground(UITheme.TEXT);
-        JLabel subtitle = new JLabel("Bootstrap  ·  4 Workers  ·  auto election  ·  RMI");
+        JLabel subtitle = new JLabel("Bootstrap  ·  " + WorkerClusterConfig.WORKER_COUNT + " Workers  ·  auto election  ·  JAC-based scheduling  ·  RMI");
         subtitle.setFont(UITheme.BASE);
         subtitle.setForeground(UITheme.MUTED);
         titleCard.add(title, gbc(0, 0, 2));
@@ -243,7 +242,6 @@ public class ServerGUI extends JFrame {
         actions.add(startBootstrapButton);
         actions.add(startWorkersButton);
         actions.add(stopWorkersButton);
-        actions.add(resetButton);
         actions.add(refreshButton);
 
         panel.add(settings, BorderLayout.NORTH);
@@ -339,25 +337,6 @@ public class ServerGUI extends JFrame {
         executor.submit(() -> {
             WorkerClusterLauncher.stop();
             log("Worker processes stopped - the dashboard will show OFFLINE");
-            refreshBackground();
-        });
-    }
-
-    private void resetCoordinators() {
-        readSettings();
-        executor.submit(() -> {
-            int cleared = 0;
-            for (int workerId : WorkerClusterConfig.workerIds()) {
-                try {
-                    WorkerService worker = lookupWorker(workerId);
-                    worker.setCurrentCoordinatorId(WorkerService.NO_COORDINATOR);
-                    cleared++;
-                } catch (Exception e) {
-                    log("Worker " + workerId + " not reachable while resetting: " + e.getMessage());
-                }
-            }
-            log("Reset coordinators on " + cleared + " worker(s) - workers re-elect automatically "
-                    + "within a few seconds.");
             refreshBackground();
         });
     }

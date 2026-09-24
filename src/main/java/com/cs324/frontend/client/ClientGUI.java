@@ -90,6 +90,7 @@ public class ClientGUI extends JFrame {
 
     private volatile String bootstrapHost = "localhost";
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
+    private volatile BootstrapService bootstrap;
     private volatile WorkerService coordinator;
     private volatile int activeWorkerCount;
 
@@ -333,13 +334,14 @@ public class ClientGUI extends JFrame {
     private void doConnect() {
         try {
             Registry registry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-            BootstrapService bootstrap = (BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
-            List<WorkerInfo> active = bootstrap.getActiveWorkers();
+            BootstrapService foundBootstrap = (BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
+            bootstrap = foundBootstrap;
+            List<WorkerInfo> active = foundBootstrap.getActiveWorkers();
             activeWorkerCount = active.size();
-            int coordinatorId = findCoordinatorId(bootstrap);
+            int coordinatorId = findCoordinatorId(foundBootstrap);
             WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
                     ? null
-                    : lookupRegistered(bootstrap, coordinatorId);
+                    : lookupRegistered(foundBootstrap, coordinatorId);
             coordinator = found;
             final int elected = coordinatorId;
             SwingUtilities.invokeLater(() -> {
@@ -422,6 +424,44 @@ public class ClientGUI extends JFrame {
         }
     }
 
+    /**
+     * Re-queries the Bootstrap Node for the currently elected coordinator. Used
+     * when a 5-job term ends so the client automatically follows the rotation to
+     * whichever worker is elected next - no manual reconnect needed.
+     */
+    private boolean refreshCoordinator() {
+        final BootstrapService currentBootstrap = bootstrap;
+        if (currentBootstrap == null) {
+            return false;
+        }
+        try {
+            int coordinatorId = findCoordinatorId(currentBootstrap);
+            WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
+                    ? null
+                    : lookupRegistered(currentBootstrap, coordinatorId);
+            coordinator = found;
+            final int elected = coordinatorId;
+            SwingUtilities.invokeLater(() -> {
+                if (elected == WorkerService.NO_COORDINATOR) {
+                    coordinatorLabel.setText("Coordinator: none (workers are electing...)");
+                    coordinatorValue.setText("None");
+                    coordinatorValue.setForeground(UITheme.WARNING);
+                    statusPill.setText("  ●  ELECTING  ");
+                    statusPill.setForeground(UITheme.WARNING);
+                } else {
+                    coordinatorLabel.setText("Coordinator: worker " + elected);
+                    coordinatorValue.setText("Worker " + elected);
+                    coordinatorValue.setForeground(UITheme.SUCCESS);
+                    statusPill.setText("  ●  ONLINE  ");
+                    statusPill.setForeground(UITheme.SUCCESS);
+                }
+            });
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     // ---------------------------------------------------------------- jobs
 
     private void submitJob() {
@@ -445,14 +485,31 @@ public class ClientGUI extends JFrame {
         jobsSubmittedValue.setText(String.valueOf(jobSequence.get()));
 
         jobExecutor.submit(() -> {
-            try {
-                Object result = dispatch(target, type, raw);
-                updateTask(jobId, "Done", result.toString(), null);
-                log("Job " + jobId + " [" + type + "] finished -> " + result);
-            } catch (Exception e) {
-                String message = rootMessage(e);
-                updateTask(jobId, "Failed", "-", message);
-                log("Job " + jobId + " [" + type + "] failed -> " + message);
+            WorkerService targetWorker = target;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    Object result = dispatch(targetWorker, type, raw);
+                    updateTask(jobId, "Done", result.toString(), null);
+                    log("Job " + jobId + " [" + type + "] finished -> " + result);
+                    return;
+                } catch (Exception e) {
+                    String message = rootMessage(e);
+                    boolean coordinatorChanged = attempt < 2 && needsNewCoordinator(message);
+                    if (coordinatorChanged && refreshCoordinator() && coordinator != null) {
+                        log("Term hand-over detected - re-resolving the new coordinator and retrying job " + jobId);
+                        targetWorker = coordinator;
+                        try {
+                            Thread.sleep(1000L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                        continue;
+                    }
+                    updateTask(jobId, "Failed", "-", coordinatorChanged ? message + " (coordinator re-elected)" : message);
+                    log("Job " + jobId + " [" + type + "] failed -> " + message);
+                    return;
+                }
             }
         });
     }
@@ -463,6 +520,12 @@ public class ClientGUI extends JFrame {
         } catch (Exception e) {
             return WorkerService.NO_COORDINATOR;
         }
+    }
+
+    /** True when the failure means the elected coordinator changed (term ended or not the coordinator). */
+    private boolean needsNewCoordinator(String message) {
+        return message != null && (message.contains("not the coordinator")
+                || message.contains("Coordinator term ended"));
     }
 
     private Object dispatch(WorkerService target, String type, String raw) throws Exception {

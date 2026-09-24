@@ -89,7 +89,7 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final AtomicInteger currentCoordinatorId = new AtomicInteger(NO_COORDINATOR);
     private final Set<String> processedElectionIds = ConcurrentHashMap.newKeySet();
     private final Set<WorkerInfo> neighbours = ConcurrentHashMap.newKeySet();
-    private final String leaderman = "cs324";
+    private static final String leaderman = "cs324";
 
     /**
      * Number of submitted jobs handled as coordinator during the current term.
@@ -258,7 +258,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             int existing = currentCoordinatorId.get();
             if (existing != NO_COORDINATOR) {
                 return "Coordinator already present: worker " + existing
-                        + " - no election started (reset coordinators to " + NO_COORDINATOR + " first)";
+                        + " - no election started (an election runs only when no coordinator "
+                        + "is active, e.g. after a 5-job term ends)";
             }
 
             refreshNeighbours();
@@ -517,9 +518,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         }
         return runPartialJob(() -> {
             int partialMax = Collections.max(numbers);
-            int updatedJac = jobAllocationCounter.incrementAndGet();
             System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
-                    + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
+                    + numbers + ", partialMax=" + partialMax);
             return partialMax;
         });
     }
@@ -607,9 +607,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                     count++;
                 }
             }
-            int updatedJac = jobAllocationCounter.incrementAndGet();
             System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
-                    + numbers + ", primes=" + count + ", JAC=" + updatedJac);
+                    + numbers + ", primes=" + count);
             return count;
         });
     }
@@ -682,9 +681,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                     sum += n;
                 }
             }
-            int updatedJac = jobAllocationCounter.incrementAndGet();
             System.out.println("[Worker " + workerId + "] PRIMESUM partial compute -> range=["
-                    + start + ", " + end + "], sum=" + sum + ", JAC=" + updatedJac);
+                    + start + ", " + end + "], sum=" + sum);
             return sum;
         });
     }
@@ -765,45 +763,49 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         }
     }
 
-    /**
-     * Rebuilds the neighbour ring from the Bootstrap Node's active-worker
-     * registry. Each worker links to its immediate predecessor and successor in
-     * the sorted registry, so the ring grows dynamically as workers register.
-     */
     private synchronized int refreshNeighbours() {
         try {
-            List<WorkerInfo> sortedAll = new ArrayList<>();
-            boolean foundSelf = false;
-            for (WorkerInfo info : bootstrapService.getActiveWorkers()) {
-                if (info.getWorkerId() == workerId) {
-                    foundSelf = true;
-                }
-                sortedAll.add(info);
-            }
+            List<WorkerInfo> active = new ArrayList<>(bootstrapService.getActiveWorkers());
+            boolean foundSelf = active.stream().anyMatch(i -> i.getWorkerId() == workerId);
             if (!foundSelf) {
-                sortedAll.add(new WorkerInfo(workerId, registeredHost, registeredPort));
+                active.add(new WorkerInfo(workerId, registeredHost, registeredPort));
             }
-            sortedAll.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
-
-            int n = sortedAll.size();
-            if (n == 1) {
+            if (active.size() <= 1) {
                 neighbours.clear();
                 return 0;
             }
+
+            active.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
+            List<WorkerInfo> others = new ArrayList<>(active);
+            others.removeIf(i -> i.getWorkerId() == workerId);
+
+            neighbours.clear();
+
+            // Ring backbone: predecessor + successor guarantee reachability so the
+            // cluster can always reach agreement on a single coordinator.
             int idx = 0;
-            for (int i = 0; i < n; i++) {
-                if (sortedAll.get(i).getWorkerId() == workerId) {
+            for (int i = 0; i < active.size(); i++) {
+                if (active.get(i).getWorkerId() == workerId) {
                     idx = i;
                     break;
                 }
             }
-            WorkerInfo predecessor = sortedAll.get((idx - 1 + n) % n);
-            WorkerInfo successor = sortedAll.get((idx + 1) % n);
-            neighbours.clear();
-            neighbours.add(predecessor);
-            if (successor.getWorkerId() != predecessor.getWorkerId()) {
+            neighbours.add(active.get((idx - 1 + active.size()) % active.size()));
+            WorkerInfo successor = active.get((idx + 1) % active.size());
+            if (successor.getWorkerId() != workerId) {
                 neighbours.add(successor);
             }
+
+            // Unstructured extra links: a new worker is randomly connected to an
+            // active worker whenever it (re)joins, so the network stays random and
+            // each worker holds only a subset of the other workers.
+            WorkerInfo randomPeer = bootstrapService.getRandomWorker();
+            if (randomPeer != null && randomPeer.getWorkerId() != workerId
+                    && neighbours.add(randomPeer)) {
+                System.out.println("[Worker " + workerId + "] random link added -> "
+                        + randomPeer.getWorkerId() + " (neighbours=" + neighbours.size() + ")");
+            }
+
             return neighbours.size();
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] neighbour sync failed: " + e.getMessage());
@@ -850,13 +852,36 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
         Collections.sort(reachableWorkerIds);
         List<WorkerService> services = new ArrayList<>();
+        Map<Integer, Integer> jacByWorker = new HashMap<>();
         for (Integer reachableWorkerId : reachableWorkerIds) {
             WorkerService service = lookupReachableWorker(activeWorkers, reachableWorkerId);
             if (service != null) {
                 services.add(service);
+                jacByWorker.put(reachableWorkerId, readJAC(service));
             }
         }
+        // Distribute work to the least-loaded workers first: ascending JAC,
+        // then ascending worker id as a stable tie-break.
+        services.sort(Comparator
+                .comparingInt((WorkerService s) -> jacByWorker.getOrDefault(readWorkerId(s), Integer.MAX_VALUE))
+                .thenComparingInt(s -> readWorkerId(s)));
         return services;
+    }
+
+    private int readJAC(WorkerService service) {
+        try {
+            return service.getJobAllocationCounter();
+        } catch (Exception e) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    private int readWorkerId(WorkerService service) {
+        try {
+            return service.getWorkerId();
+        } catch (Exception e) {
+            return Integer.MAX_VALUE;
+        }
     }
 
     private WorkerService lookupReachableWorker(Map<Integer, WorkerInfo> activeWorkers, int targetWorkerId) {
