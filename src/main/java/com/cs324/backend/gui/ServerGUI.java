@@ -1,16 +1,15 @@
 package com.cs324.backend.gui;
 
-import com.cs324.backend.api.BootstrapService;
 import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
 import com.cs324.backend.bootstrap.BootstrapServiceImpl;
 import com.cs324.backend.worker.WorkerClusterConfig;
 import com.cs324.backend.worker.WorkerClusterLauncher;
 import com.cs324.backend.worker.WorkerServer;
+import com.cs324.frontend.ui.UITheme;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
-import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
@@ -21,13 +20,18 @@ import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.table.AbstractTableModel;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.Insets;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.ExportException;
@@ -35,33 +39,39 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Server-side GUI. From here the Bootstrap Node and the four worker
- * processes are started, elections can be triggered, and the live cluster
- * state (reachability, JAC, coordinator agreement) is shown in a table so
- * an operator can confirm the network is online before clients launch.
+ * Server-side GUI. From here the Bootstrap Node and the four worker processes
+ * are started and stopped. The workers elect a coordinator automatically in the
+ * background, so the operator just watches the dashboard: network online / offline,
+ * which worker was elected, and the live per-worker state table.
  *
- * <p>Heavy actions (bootstrap start, worker launch, elections) run on a
- * background executor; the UI is only touched through {@code invokeLater}.</p>
+ * <p>Heavy actions (bootstrap start, worker launch) run on a background
+ * executor; the UI is only touched through {@code invokeLater}.</p>
  */
 public class ServerGUI extends JFrame {
 
-    private static final String[] COLUMNS = {"Worker", "Port", "Reachable", "JAC", "JobsThisTerm", "Coordinator", "Neighbours", "Leaderman"};
+    private static final String[] COLUMNS = {"Worker", "Port", "Online", "JAC", "JobsThisTerm", "Coordinator", "Neighbours", "Leaderman"};
 
     private final JTextField hostField = new JTextField(WorkerClusterConfig.DEFAULT_HOST, 10);
     private final JTextField bootstrapPortField = new JTextField(String.valueOf(BootstrapServer.DEFAULT_PORT), 6);
     private final JLabel bootstrapStatus = new JLabel("Bootstrap: not started");
-    private final JLabel coordinatorStatus = new JLabel("Coordinator: none");
 
     private final JButton startBootstrapButton = new JButton("Start Bootstrap");
     private final JButton startWorkersButton = new JButton("Start Workers");
     private final JButton stopWorkersButton = new JButton("Stop Workers");
-    private final JButton electionButton = new JButton("Run Election");
     private final JButton resetButton = new JButton("Reset Coordinators");
     private final JButton refreshButton = new JButton("Refresh");
+
+    // Dashboard widgets.
+    private final JLabel networkPill = new JLabel("  ●  OFFLINE  ");
+    private final JLabel networkDetail = new JLabel("Workers online: 0/" + WorkerClusterConfig.WORKER_COUNT);
+    private final JLabel coordinatorValue = new JLabel("None");
+    private final JLabel electionValue = new JLabel("Waiting for workers...");
 
     private final JTextArea logArea = new JTextArea(10, 60);
     private final JTable statusTable = new JTable();
@@ -75,6 +85,7 @@ public class ServerGUI extends JFrame {
 
     private volatile String bootstrapHost = WorkerClusterConfig.DEFAULT_HOST;
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
+    private int previousCoordinator = WorkerService.NO_COORDINATOR;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new ServerGUI().setVisible(true));
@@ -82,72 +93,191 @@ public class ServerGUI extends JFrame {
 
     public ServerGUI() {
         super("CS324 Cluster Server Manager");
+        UITheme.install();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(820, 620);
+        setSize(960, 760);
+        setMinimumSize(new java.awt.Dimension(880, 660));
         setLocationRelativeTo(null);
 
-        getContentPane().add(buildControlPanel(), BorderLayout.NORTH);
-        getContentPane().add(buildCenter(), BorderLayout.CENTER);
+        style();
+
+        getContentPane().setLayout(new BorderLayout());
+        getContentPane().add(buildDashboard(), BorderLayout.NORTH);
+        getContentPane().add(buildMain(), BorderLayout.CENTER);
 
         startBootstrapButton.addActionListener(e -> startBootstrap());
         startWorkersButton.addActionListener(e -> startWorkers());
         stopWorkersButton.addActionListener(e -> stopWorkers());
-        electionButton.addActionListener(e -> runElection());
         resetButton.addActionListener(e -> resetCoordinators());
         refreshButton.addActionListener(e -> refreshStatus());
 
-        logArea.setEditable(false);
-        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        statusTable.setModel(tableModel);
-        statusTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        log("Server manager ready. Start the Bootstrap Node, then start the workers - "
+                + "they elect a coordinator automatically, no manual trigger needed.");
 
-        log("Server manager ready. Start the Bootstrap Node, then start the workers.");
-
-        Timer timer = new Timer(3000, e -> refreshBackground());
+        Timer timer = new Timer(2500, e -> refreshBackground());
         timer.start();
     }
 
-    private JPanel buildControlPanel() {
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setBorder(BorderFactory.createTitledBorder("Cluster Management"));
+    private void style() {
+        getContentPane().setBackground(UITheme.BACKGROUND);
+        UITheme.label(bootstrapStatus, UITheme.MUTED);
+        for (JButton button : new JButton[]{startBootstrapButton, startWorkersButton,
+                stopWorkersButton, resetButton, refreshButton}) {
+            UITheme.button(button);
+        }
+        UITheme.textField(hostField);
+        UITheme.textField(bootstrapPortField);
+        UITheme.textArea(logArea);
+        UITheme.table(statusTable);
+        statusTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+    }
 
-        JPanel settings = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        settings.add(new JLabel("Host:"));
-        settings.add(hostField);
-        settings.add(new JLabel("Bootstrap port:"));
-        settings.add(bootstrapPortField);
+    // ---------------------------------------------------------------- dashboard
 
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        actions.add(startBootstrapButton);
-        actions.add(startWorkersButton);
-        actions.add(stopWorkersButton);
-        actions.add(electionButton);
-        actions.add(resetButton);
-        actions.add(refreshButton);
+    private JPanel buildDashboard() {
+        JPanel dashboard = new JPanel(new GridBagLayout());
+        dashboard.setBackground(UITheme.BACKGROUND);
 
-        JPanel status = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        status.add(bootstrapStatus);
-        status.add(coordinatorStatus);
+        JPanel networkCard = card();
+        networkPill.setFont(UITheme.BIG);
+        networkPill.setForeground(UITheme.ERROR);
+        networkPill.setHorizontalAlignment(SwingConstants.CENTER);
+        networkPill.setBackground(UITheme.CARD);
+        networkPill.setOpaque(true);
+        networkPill.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UITheme.ERROR, 2),
+                BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+        networkDetail.setFont(UITheme.MEDIUM);
+        networkDetail.setForeground(UITheme.MUTED);
+        networkDetail.setHorizontalAlignment(SwingConstants.CENTER);
+        networkCard.add(networkPill, gbc(0, 0, 2));
+        networkCard.add(networkDetail, gbc(0, 1, 2));
 
-        panel.add(settings, BorderLayout.NORTH);
-        panel.add(actions, BorderLayout.CENTER);
-        panel.add(status, BorderLayout.SOUTH);
+        JPanel coordinatorCard = card();
+        coordinatorValue.setFont(UITheme.BIG);
+        coordinatorValue.setForeground(UITheme.TEXT);
+        coordinatorValue.setHorizontalAlignment(SwingConstants.CENTER);
+        coordinatorCard.add(cardTitle("Elected Coordinator"), gbc(0, 0, 2));
+        coordinatorCard.add(coordinatorValue, gbc(0, 1, 2));
+
+        JPanel electionCard = card();
+        electionValue.setFont(UITheme.BIG);
+        electionValue.setForeground(UITheme.WARNING);
+        electionValue.setHorizontalAlignment(SwingConstants.CENTER);
+        electionCard.add(cardTitle("Election"), gbc(0, 0, 2));
+        electionCard.add(electionValue, gbc(0, 1, 2));
+
+        JPanel titleCard = card();
+        JLabel title = new JLabel("Cluster Server Manager");
+        title.setFont(UITheme.TITLE);
+        title.setForeground(UITheme.TEXT);
+        JLabel subtitle = new JLabel("Bootstrap  ·  4 Workers  ·  auto election  ·  RMI");
+        subtitle.setFont(UITheme.BASE);
+        subtitle.setForeground(UITheme.MUTED);
+        titleCard.add(title, gbc(0, 0, 2));
+        titleCard.add(subtitle, gbc(0, 1, 2));
+
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridx = 0;
+        g.gridy = 0;
+        g.weightx = 1;
+        g.weighty = 1;
+        g.fill = GridBagConstraints.BOTH;
+        g.insets = new Insets(8, 8, 8, 8);
+        dashboard.add(titleCard, g);
+        g.gridx = 1;
+        dashboard.add(networkCard, g);
+        g.gridx = 2;
+        dashboard.add(coordinatorCard, g);
+        g.gridx = 3;
+        dashboard.add(electionCard, g);
+        return dashboard;
+    }
+
+    private static JPanel card() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBackground(UITheme.CARD);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UITheme.BORDER),
+                BorderFactory.createEmptyBorder(10, 10, 10, 10)));
         return panel;
     }
 
-    private JComponent buildCenter() {
+    private static JLabel cardTitle(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(UITheme.SECTION);
+        label.setForeground(UITheme.MUTED);
+        label.setHorizontalAlignment(SwingConstants.CENTER);
+        return label;
+    }
+
+    private static GridBagConstraints gbc(int x, int y, int width) {
+        GridBagConstraints c = new GridBagConstraints();
+        c.gridx = x;
+        c.gridy = y;
+        c.gridwidth = width;
+        c.insets = new Insets(4, 4, 4, 4);
+        return c;
+    }
+
+    // ---------------------------------------------------------------- panels
+
+    private JPanel buildControlPanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        UITheme.panel(panel);
+        panel.setBorder(UITheme.titledBorder("Cluster Management"));
+
+        JPanel settings = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
+        settings.setBackground(UITheme.PANEL);
+        JLabel hostLabel = new JLabel("Host:");
+        UITheme.label(hostLabel, UITheme.MUTED);
+        JLabel portLabel = new JLabel("Bootstrap port:");
+        UITheme.label(portLabel, UITheme.MUTED);
+        settings.add(hostLabel);
+        settings.add(hostField);
+        settings.add(portLabel);
+        settings.add(bootstrapPortField);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 8));
+        actions.setBackground(UITheme.PANEL);
+        actions.add(startBootstrapButton);
+        actions.add(startWorkersButton);
+        actions.add(stopWorkersButton);
+        actions.add(resetButton);
+        actions.add(refreshButton);
+
+        panel.add(settings, BorderLayout.NORTH);
+        panel.add(actions, BorderLayout.CENTER);
+        panel.add(bootstrapStatus, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private Component buildMain() {
         JPanel tablePanel = new JPanel(new BorderLayout());
-        tablePanel.setBorder(BorderFactory.createTitledBorder("Cluster State (auto-refreshes)"));
-        tablePanel.add(new JScrollPane(statusTable), BorderLayout.CENTER);
+        tablePanel.setBackground(UITheme.PANEL);
+        JScrollPane tableScroll = new JScrollPane(statusTable);
+        UITheme.scroll(tableScroll);
+        tablePanel.add(tableScroll, BorderLayout.CENTER);
 
         JPanel logPanel = new JPanel(new BorderLayout());
-        logPanel.setBorder(BorderFactory.createTitledBorder("Log"));
-        logPanel.add(new JScrollPane(logArea), BorderLayout.CENTER);
+        logPanel.setBackground(UITheme.PANEL);
+        JScrollPane logScroll = new JScrollPane(logArea);
+        UITheme.scroll(logScroll);
+        logPanel.add(logScroll, BorderLayout.CENTER);
 
         JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePanel, logPanel);
-        split.setResizeWeight(0.6);
-        return split;
+        split.setResizeWeight(0.55);
+        split.setBackground(UITheme.BACKGROUND);
+        split.setBorder(UITheme.titledBorder("Cluster State (auto-refreshes)"));
+
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.setBackground(UITheme.BACKGROUND);
+        wrapper.add(buildControlPanel(), BorderLayout.NORTH);
+        wrapper.add(split, BorderLayout.CENTER);
+        return wrapper;
     }
+
+    // ---------------------------------------------------------------- actions
 
     private void startBootstrap() {
         readSettings();
@@ -168,9 +298,10 @@ public class ServerGUI extends JFrame {
                     log("Bootstrap Node started and bound on port " + bootstrapPort);
                 }
                 SwingUtilities.invokeLater(() -> {
-                    bootstrapStatus.setForeground(new Color(0, 128, 0));
+                    bootstrapStatus.setForeground(UITheme.SUCCESS);
                     bootstrapStatus.setText("Bootstrap: running on " + bootstrapHost + ":" + bootstrapPort);
                     startBootstrapButton.setEnabled(true);
+                    refreshBackground();
                 });
             } catch (Exception e) {
                 SwingUtilities.invokeLater(() -> {
@@ -185,50 +316,30 @@ public class ServerGUI extends JFrame {
         readSettings();
         startWorkersButton.setEnabled(false);
         executor.submit(() -> {
+            boolean started = false;
             try {
                 log("Launching " + WorkerClusterConfig.WORKER_COUNT + " worker processes (this can take a few seconds)...");
                 WorkerClusterLauncher.start(bootstrapHost, bootstrapPort);
-                SwingUtilities.invokeLater(() -> {
-                    log("Worker cluster launch finished - refreshing state");
-                    startWorkersButton.setEnabled(true);
-                    refreshBackground();
-                });
+                started = true;
             } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> {
-                    startWorkersButton.setEnabled(true);
-                    appendError("Could not start workers: " + rootMessage(e));
-                });
+                log("Could not start workers: " + rootMessage(e));
             }
+            final boolean ok = started;
+            SwingUtilities.invokeLater(() -> {
+                startWorkersButton.setEnabled(true);
+                if (ok) {
+                    log("Workers launched - they elect a coordinator automatically in the background.");
+                }
+                refreshBackground();
+            });
         });
     }
 
     private void stopWorkers() {
         executor.submit(() -> {
             WorkerClusterLauncher.stop();
-            log("Worker processes stopped - refreshing state");
+            log("Worker processes stopped - the dashboard will show OFFLINE");
             refreshBackground();
-        });
-    }
-
-    private void runElection() {
-        readSettings();
-        electionButton.setEnabled(false);
-        executor.submit(() -> {
-            try {
-                WorkerService initiator = lookupWorker(WorkerClusterConfig.FIRST_WORKER_ID);
-                log("Initiating leader election from worker " + WorkerClusterConfig.FIRST_WORKER_ID + "...");
-                String result = initiator.initiateElection();
-                log("Election result: " + result);
-                SwingUtilities.invokeLater(() -> {
-                    electionButton.setEnabled(true);
-                    refreshBackground();
-                });
-            } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> {
-                    electionButton.setEnabled(true);
-                    appendError("Election failed: " + rootMessage(e));
-                });
-            }
         });
     }
 
@@ -245,7 +356,8 @@ public class ServerGUI extends JFrame {
                     log("Worker " + workerId + " not reachable while resetting: " + e.getMessage());
                 }
             }
-            log("Reset coordinators on " + cleared + " worker(s) - run a new election to re-elect");
+            log("Reset coordinators on " + cleared + " worker(s) - workers re-elect automatically "
+                    + "within a few seconds.");
             refreshBackground();
         });
     }
@@ -254,10 +366,12 @@ public class ServerGUI extends JFrame {
         executor.submit(this::refreshBackground);
     }
 
+    // ---------------------------------------------------------------- status collection
+
     private void refreshBackground() {
         List<Object[]> rows = new ArrayList<>();
         int reachable = 0;
-        java.util.Set<Integer> coordinators = new java.util.TreeSet<>();
+        Set<Integer> coordinators = new TreeSet<>();
 
         for (int workerId : WorkerClusterConfig.workerIds()) {
             try {
@@ -282,17 +396,61 @@ public class ServerGUI extends JFrame {
         final int reachableCount = reachable;
         final int total = WorkerClusterConfig.WORKER_COUNT;
         final boolean agreed = coordinators.size() == 1 && !coordinators.contains(WorkerService.NO_COORDINATOR);
-        final String coordinatorText = reachableCount == 0 ? "none"
-                : agreed ? "worker " + coordinators.iterator().next()
-                : reachableCount == total && coordinators.contains(WorkerService.NO_COORDINATOR)
-                ? "none elected yet - press Run Election"
-                : "mismatch across workers";
+        final int elected = agreed ? coordinators.iterator().next() : WorkerService.NO_COORDINATOR;
 
         SwingUtilities.invokeLater(() -> {
             tableModel.setRows(rows);
-            coordinatorStatus.setText("Network: " + reachableCount + "/" + total + " workers reachable | Coordinator: " + coordinatorText);
-            coordinatorStatus.setForeground(agreed ? new Color(0, 128, 0) : Color.ORANGE);
+            updateDashboard(reachableCount, total, agreed, elected,
+                    coordinators.contains(WorkerService.NO_COORDINATOR));
+            if (elected != previousCoordinator) {
+                if (elected != WorkerService.NO_COORDINATOR) {
+                    log("Election complete -> coordinator is worker " + elected);
+                }
+                previousCoordinator = elected;
+            }
         });
+    }
+
+    private void updateDashboard(int reachable, int total, boolean agreed, int elected, boolean anyWithoutCoordinator) {
+        if (reachable == 0) {
+            networkPill.setText("  ●  OFFLINE  ");
+            networkPill.setForeground(UITheme.ERROR);
+            networkPill.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(UITheme.ERROR, 2),
+                    BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+            electionValue.setText("No workers");
+            electionValue.setForeground(UITheme.MUTED);
+        } else if (reachable == total) {
+            networkPill.setText("  ●  ONLINE  ");
+            networkPill.setForeground(UITheme.SUCCESS);
+            networkPill.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(UITheme.SUCCESS, 2),
+                    BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+        } else {
+            networkPill.setText("  ●  PARTIAL  ");
+            networkPill.setForeground(UITheme.WARNING);
+            networkPill.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(UITheme.WARNING, 2),
+                    BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+        }
+        networkDetail.setText("Workers online: " + reachable + "/" + total);
+
+        if (agreed) {
+            coordinatorValue.setText("Worker " + elected);
+            coordinatorValue.setForeground(UITheme.SUCCESS);
+            electionValue.setText("COMPLETE");
+            electionValue.setForeground(UITheme.SUCCESS);
+        } else if (reachable > 0 && anyWithoutCoordinator) {
+            coordinatorValue.setText("None");
+            coordinatorValue.setForeground(UITheme.MUTED);
+            electionValue.setText(reachable == total ? "ELECTING..." : "Partial network");
+            electionValue.setForeground(UITheme.WARNING);
+        } else {
+            coordinatorValue.setText("Mismatch");
+            coordinatorValue.setForeground(UITheme.ERROR);
+            electionValue.setText("DIVERGED");
+            electionValue.setForeground(UITheme.ERROR);
+        }
     }
 
     private void readSettings() {

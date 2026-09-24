@@ -41,6 +41,7 @@ public class WorkerServer {
 
             bootstrap.registerWorker(self);
             worker.syncNeighbours();
+            worker.startAutoElectionChecks();
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
 

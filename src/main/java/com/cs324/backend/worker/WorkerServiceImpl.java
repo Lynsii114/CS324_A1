@@ -30,6 +30,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -99,11 +102,27 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
 
     /**
+     * Guards against a worker running two elections at once (e.g. its background
+     * auto-election check colliding with the re-election that ends a term, or
+     * with an election message flood it is currently participating in).
+     */
+    private final AtomicBoolean electionInProgress = new AtomicBoolean(false);
+
+    /**
      * Runs submitted jobs and partial computations concurrently. Daemon threads
      * never keep the JVM alive; RMI exports already do that. Built in the
      * constructor because the pool must be sized with the worker id in hand.
      */
     private final ExecutorService jobExecutor;
+
+    /**
+     * Periodically checks whether the cluster is missing a coordinator and, if
+     * so, quietly starts a leader election. This is what lets a freshly started
+     * cluster elect a coordinator automatically (no manual trigger needed) and
+     * lets the cluster re-elect itself after a coordinator reset.
+     * Built in the constructor because the thread name needs the worker id.
+     */
+    private final ScheduledExecutorService electionScheduler;
 
     public WorkerServiceImpl(int workerId, WorkerInfo self, BootstrapService bootstrapService)
             throws RemoteException {
@@ -112,6 +131,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         this.registeredHost = self.getHost();
         this.registeredPort = self.getPort();
         this.bootstrapService = bootstrapService;
+        this.electionScheduler = Executors.newSingleThreadScheduledExecutor(
+                runnable -> {
+                    Thread thread = new Thread(runnable, "election-check-" + workerId);
+                    thread.setDaemon(true);
+                    return thread;
+                });
         this.jobExecutor = Executors.newFixedThreadPool(
                 Math.max(WorkerService.COORDINATOR_TERM_LIMIT + 1, Runtime.getRuntime().availableProcessors()),
                 runnable -> {
@@ -226,41 +251,48 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     @Override
     public String initiateElection() throws RemoteException {
-        int existing = currentCoordinatorId.get();
-        if (existing != NO_COORDINATOR) {
-            return "Coordinator already present: worker " + existing
-                    + " - no election started (reset coordinators to " + NO_COORDINATOR + " first)";
+        if (!electionInProgress.compareAndSet(false, true)) {
+            return "Election already in progress - ignoring new election request";
         }
+        try {
+            int existing = currentCoordinatorId.get();
+            if (existing != NO_COORDINATOR) {
+                return "Coordinator already present: worker " + existing
+                        + " - no election started (reset coordinators to " + NO_COORDINATOR + " first)";
+            }
 
-        refreshNeighbours();
+            refreshNeighbours();
 
-        CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
-        String electionId = UUID.randomUUID().toString();
-        // The initiator marks its own election as processed so a message that
-        // loops back to it is dropped instead of being handled twice.
-        processedElectionIds.add(electionId);
+            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
+            String electionId = UUID.randomUUID().toString();
+            // The initiator marks its own election as processed so a message that
+            // loops back to it is dropped instead of being handled twice.
+            processedElectionIds.add(electionId);
 
-        System.out.println("[Worker " + workerId + "] election " + electionId + " started, JAC=" + self.getJac()
-                + ", neighbours=" + neighbours.size());
+            System.out.println("[Worker " + workerId + "] election " + electionId + " started, JAC=" + self.getJac()
+                    + ", neighbours=" + neighbours.size());
 
-        ElectionMessage message = new ElectionMessage(electionId, self, self, new LinkedHashSet<>());
-        ProcessedParticipants collected = propagateToNeighbours(message);
+            ElectionMessage message = new ElectionMessage(electionId, self, self, new LinkedHashSet<>());
+            ProcessedParticipants collected = propagateToNeighbours(message);
 
-        Set<CandidateInfo> allParticipants = new LinkedHashSet<>(collected.getParticipants());
-        allParticipants.add(self);
+            Set<CandidateInfo> allParticipants = new LinkedHashSet<>(collected.getParticipants());
+            allParticipants.add(self);
 
-        CandidateInfo winner = selectWinner(allParticipants);
-        recordCoordinator(winner.getWorkerId());
+            CandidateInfo winner = selectWinner(allParticipants);
+            recordCoordinator(winner.getWorkerId());
 
-        System.out.println("[Worker " + workerId + "] election " + electionId + " winner: worker "
-                + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
-                + allParticipants.size() + " reachable workers");
+            System.out.println("[Worker " + workerId + "] election " + electionId + " winner: worker "
+                    + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
+                    + allParticipants.size() + " reachable workers");
 
-        WinnerAnnouncement announcement = new WinnerAnnouncement(electionId, winner, allParticipants);
-        broadcastWinner(announcement);
+            WinnerAnnouncement announcement = new WinnerAnnouncement(electionId, winner, allParticipants);
+            broadcastWinner(announcement);
 
-        return "Coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
-                + ") across " + allParticipants.size() + " reachable workers [electionId=" + electionId + "]";
+            return "Coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
+                    + ") across " + allParticipants.size() + " reachable workers [electionId=" + electionId + "]";
+        } finally {
+            electionInProgress.set(false);
+        }
     }
 
     @Override
@@ -274,14 +306,57 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             return null;
         }
 
-        refreshNeighbours();
+        boolean wasInProgress = electionInProgress.getAndSet(true);
+        try {
+            refreshNeighbours();
 
-        CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
-        Set<CandidateInfo> participants = new LinkedHashSet<>(message.getParticipants());
-        participants.add(self);
+            CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
+            Set<CandidateInfo> participants = new LinkedHashSet<>(message.getParticipants());
+            participants.add(self);
 
-        ElectionMessage forwarded = new ElectionMessage(message.getElectionId(), message.getOriginator(), self, participants);
-        return propagateToNeighbours(forwarded);
+            ElectionMessage forwarded = new ElectionMessage(message.getElectionId(), message.getOriginator(), self, participants);
+            return propagateToNeighbours(forwarded);
+        } finally {
+            electionInProgress.set(wasInProgress);
+        }
+    }
+
+    /**
+     * Starts the background auto-election checks. Called once the worker has
+     * registered with the Bootstrap Node and has its neighbours, so each election
+     * covers the full cluster. The staggered initial delay keeps the workers from
+     * all starting elections in the same instant.
+     */
+    public void startAutoElectionChecks() {
+        long initialDelay = Math.max(FIRST_WORKER_DELAY_MS, (long) workerId * WORKER_DELAY_STEP_MS);
+        electionScheduler.scheduleWithFixedDelay(this::autoElectionTick,
+                initialDelay, AUTO_ELECTION_PERIOD_MS, TimeUnit.MILLISECONDS);
+        System.out.println("[Worker " + workerId + "] auto-election checks started (first check in "
+                + initialDelay + " ms)");
+    }
+
+    private static final long FIRST_WORKER_DELAY_MS = 2_500;
+    private static final long WORKER_DELAY_STEP_MS = 2_000;
+    private static final long AUTO_ELECTION_PERIOD_MS = 4_000;
+
+    /**
+     * Fires on the scheduler thread. If the cluster currently has no coordinator
+     * and this worker is not taking part in another election, it quietly starts
+     * one. Once a coordinator exists the check does nothing, so a healthy cluster
+     * never re-elects.
+     */
+    private void autoElectionTick() {
+        if (currentCoordinatorId.get() != NO_COORDINATOR || electionInProgress.get()) {
+            return;
+        }
+        try {
+            String result = initiateElection();
+            if (!result.startsWith("Coordinator already present")) {
+                System.out.println("[Worker " + workerId + "] auto-election result: " + result);
+            }
+        } catch (RemoteException e) {
+            System.err.println("[Worker " + workerId + "] auto-election failed: " + e.getMessage());
+        }
     }
 
     @Override

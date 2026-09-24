@@ -4,7 +4,9 @@ import com.cs324.backend.api.BootstrapService;
 import com.cs324.backend.api.WorkerInfo;
 import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
+import com.cs324.backend.worker.WorkerClusterConfig;
 import com.cs324.backend.worker.WorkerServer;
+import com.cs324.frontend.ui.UITheme;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -20,12 +22,16 @@ import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.table.AbstractTableModel;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.FlowLayout;
-import java.awt.Font;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.Insets;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -63,6 +69,12 @@ public class ClientGUI extends JFrame {
     private final JButton loadCsvButton = new JButton("Load CSV...");
     private final JButton submitButton = new JButton("Submit");
     private final JButton clearButton = new JButton("Clear");
+
+    // Dashboard widgets.
+    private final JLabel statusPill = new JLabel("  ●  OFFLINE  ");
+    private final JLabel coordinatorValue = new JLabel("None");
+    private final JLabel workersValue = new JLabel("0/" + WorkerClusterConfig.WORKER_COUNT);
+    private final JLabel jobsSubmittedValue = new JLabel("0");
     private final JLabel coordinatorLabel = new JLabel("Coordinator: none");
 
     private final JTextArea logArea = new JTextArea(8, 60);
@@ -79,6 +91,7 @@ public class ClientGUI extends JFrame {
     private volatile String bootstrapHost = "localhost";
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
     private volatile WorkerService coordinator;
+    private volatile int activeWorkerCount;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new ClientGUI().setVisible(true));
@@ -86,12 +99,18 @@ public class ClientGUI extends JFrame {
 
     public ClientGUI() {
         super("CS324 Distributed Client");
+        UITheme.install();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(780, 660);
+        setSize(960, 760);
+        setMinimumSize(new java.awt.Dimension(880, 660));
         setLocationRelativeTo(null);
 
-        getContentPane().add(buildConnectionPanel(), BorderLayout.NORTH);
-        getContentPane().add(buildCenter(), BorderLayout.CENTER);
+        getContentPane().setLayout(new BorderLayout());
+        getContentPane().setBackground(UITheme.BACKGROUND);
+        getContentPane().add(buildDashboard(), BorderLayout.NORTH);
+        getContentPane().add(buildMain(), BorderLayout.CENTER);
+
+        style();
 
         connectButton.addActionListener(e -> connect());
         submitButton.addActionListener(e -> submitJob());
@@ -102,65 +121,190 @@ public class ClientGUI extends JFrame {
         });
         jobTypeCombo.addActionListener(e -> updateHint());
 
-        logArea.setEditable(false);
-        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        taskTable.setModel(tableModel);
-        taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        taskTable.setAutoCreateRowSorter(true);
-
         updateHint();
-        log("Client ready. Connect to the Bootstrap Node, then submit jobs (runs in the background).");
+        log("Client ready. Connect to the Bootstrap Node, then submit jobs (they run in the background).");
     }
 
-    private JPanel buildConnectionPanel() {
-        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        panel.setBorder(BorderFactory.createTitledBorder("Connection"));
-        panel.add(new JLabel("Bootstrap host:"));
-        panel.add(hostField);
-        panel.add(new JLabel("Port:"));
-        panel.add(bootstrapPortField);
-        panel.add(connectButton);
-        panel.add(connectionStatus);
+    private void style() {
+        UITheme.button(connectButton);
+        UITheme.button(loadCsvButton);
+        UITheme.button(clearButton);
+        UITheme.button(submitButton);
+        UITheme.textField(hostField);
+        UITheme.textField(bootstrapPortField);
+        UITheme.textArea(inputArea);
+        UITheme.textArea(logArea);
+        UITheme.combo(jobTypeCombo);
+        UITheme.table(taskTable);
+        taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        taskTable.setAutoCreateRowSorter(true);
+        UITheme.label(connectionStatus, UITheme.MUTED);
+        UITheme.label(coordinatorLabel, UITheme.MUTED);
+        logArea.setEditable(false);
+    }
+
+    // ---------------------------------------------------------------- dashboard
+
+    private JPanel buildDashboard() {
+        JPanel dashboard = new JPanel(new GridBagLayout());
+        dashboard.setBackground(UITheme.BACKGROUND);
+
+        JPanel connectionCard = card();
+        statusPill.setFont(UITheme.BIG);
+        statusPill.setForeground(UITheme.ERROR);
+        statusPill.setHorizontalAlignment(SwingConstants.CENTER);
+        statusPill.setOpaque(true);
+        statusPill.setBackground(UITheme.CARD);
+        statusPill.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UITheme.ERROR, 2),
+                BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+        connectionCard.add(cardTitle("Client Status"), gbc(0, 0, 2));
+        connectionCard.add(statusPill, gbc(0, 1, 2));
+
+        JPanel coordinatorCard = card();
+        coordinatorValue.setFont(UITheme.BIG);
+        coordinatorValue.setForeground(UITheme.TEXT);
+        coordinatorValue.setHorizontalAlignment(SwingConstants.CENTER);
+        coordinatorCard.add(cardTitle("Coordinator (Elected Node)"), gbc(0, 0, 2));
+        coordinatorCard.add(coordinatorValue, gbc(0, 1, 2));
+
+        JPanel statsCard = card();
+        workersValue.setFont(UITheme.BIG);
+        workersValue.setForeground(UITheme.TEXT);
+        workersValue.setHorizontalAlignment(SwingConstants.CENTER);
+        jobsSubmittedValue.setFont(UITheme.BIG);
+        jobsSubmittedValue.setForeground(UITheme.ACCENT);
+        jobsSubmittedValue.setHorizontalAlignment(SwingConstants.CENTER);
+        statsCard.add(cardTitle("Workers Online"), gbc(0, 0, 2));
+        statsCard.add(workersValue, gbc(0, 1, 2));
+        statsCard.add(cardTitle("Jobs Submitted"), gbc(0, 2, 2));
+        statsCard.add(jobsSubmittedValue, gbc(0, 3, 2));
+
+        JPanel titleCard = card();
+        JLabel title = new JLabel("Distributed Client");
+        title.setFont(UITheme.TITLE);
+        title.setForeground(UITheme.TEXT);
+        JLabel subtitle = new JLabel("MAX  ·  PRIMECOUNT  ·  PRIMESUM   (manual or CSV)");
+        subtitle.setFont(UITheme.BASE);
+        subtitle.setForeground(UITheme.MUTED);
+        titleCard.add(title, gbc(0, 0, 2));
+        titleCard.add(subtitle, gbc(0, 1, 2));
+
+        GridBagConstraints g = new GridBagConstraints();
+        g.gridy = 0;
+        g.weightx = 1;
+        g.weighty = 1;
+        g.fill = GridBagConstraints.BOTH;
+        g.insets = new Insets(8, 8, 8, 8);
+        g.gridx = 0;
+        dashboard.add(titleCard, g);
+        g.gridx = 1;
+        dashboard.add(connectionCard, g);
+        g.gridx = 2;
+        dashboard.add(coordinatorCard, g);
+        g.gridx = 3;
+        dashboard.add(statsCard, g);
+        return dashboard;
+    }
+
+    private static JPanel card() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBackground(UITheme.CARD);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(UITheme.BORDER),
+                BorderFactory.createEmptyBorder(10, 10, 10, 10)));
         return panel;
     }
 
-    private JPanel buildCenter() {
-        JPanel jobPanel = new JPanel(new BorderLayout());
-        jobPanel.setBorder(BorderFactory.createTitledBorder("Job"));
+    private static JLabel cardTitle(String text) {
+        JLabel label = new JLabel(text);
+        label.setFont(UITheme.SECTION);
+        label.setForeground(UITheme.MUTED);
+        label.setHorizontalAlignment(SwingConstants.CENTER);
+        return label;
+    }
 
-        JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        header.add(new JLabel("Job type:"));
-        header.add(jobTypeCombo);
-        header.add(coordinatorLabel);
+    private static GridBagConstraints gbc(int x, int y, int width) {
+        GridBagConstraints c = new GridBagConstraints();
+        c.gridx = x;
+        c.gridy = y;
+        c.gridwidth = width;
+        c.insets = new Insets(4, 4, 4, 4);
+        return c;
+    }
 
-        JPanel input = new JPanel(new BorderLayout(4, 4));
-        input.add(new JScrollPane(inputArea), BorderLayout.CENTER);
+    // ---------------------------------------------------------------- panels
 
-        JPanel footer = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-        footer.add(loadCsvButton);
-        footer.add(clearButton);
-        footer.add(submitButton);
+    private Component buildMain() {
+        JPanel connectionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
+        connectionPanel.setBackground(UITheme.PANEL);
+        connectionPanel.setBorder(UITheme.titledBorder("Connection"));
+        JLabel hostLabel = new JLabel("Bootstrap host:");
+        UITheme.label(hostLabel, UITheme.MUTED);
+        JLabel portLabel = new JLabel("Port:");
+        UITheme.label(portLabel, UITheme.MUTED);
+        connectionPanel.add(hostLabel);
+        connectionPanel.add(hostField);
+        connectionPanel.add(portLabel);
+        connectionPanel.add(bootstrapPortField);
+        connectionPanel.add(connectButton);
+        connectionPanel.add(connectionStatus);
 
-        JPanel jobInput = new JPanel(new BorderLayout());
-        jobInput.add(header, BorderLayout.NORTH);
-        jobInput.add(input, BorderLayout.CENTER);
-        jobInput.add(footer, BorderLayout.SOUTH);
+        JPanel jobPanel = new JPanel(new BorderLayout(8, 8));
+        jobPanel.setBackground(UITheme.PANEL);
+        jobPanel.setBorder(UITheme.titledBorder("Job"));
+
+        JPanel jobHeader = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
+        jobHeader.setBackground(UITheme.PANEL);
+        JLabel typeLabel = new JLabel("Job type:");
+        UITheme.label(typeLabel, UITheme.MUTED);
+        jobHeader.add(typeLabel);
+        jobHeader.add(jobTypeCombo);
+        jobHeader.add(coordinatorLabel);
+
+        JPanel jobButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 8));
+        jobButtons.setBackground(UITheme.PANEL);
+        jobButtons.add(loadCsvButton);
+        jobButtons.add(clearButton);
+        jobButtons.add(submitButton);
+
+        JPanel inputPanel = new JPanel(new BorderLayout());
+        inputPanel.setBackground(UITheme.PANEL);
+        JScrollPane inputScroll = new JScrollPane(inputArea);
+        UITheme.scroll(inputScroll);
+        inputPanel.add(inputScroll, BorderLayout.CENTER);
+
+        jobPanel.add(jobHeader, BorderLayout.NORTH);
+        jobPanel.add(inputPanel, BorderLayout.CENTER);
+        jobPanel.add(jobButtons, BorderLayout.SOUTH);
+
+        JPanel top = new JPanel(new BorderLayout(8, 8));
+        top.setBackground(UITheme.BACKGROUND);
+        top.add(connectionPanel, BorderLayout.NORTH);
+        top.add(jobPanel, BorderLayout.CENTER);
 
         JPanel tablePanel = new JPanel(new BorderLayout());
-        tablePanel.setBorder(BorderFactory.createTitledBorder("Tasks (concurrent submissions supported)"));
-        tablePanel.add(new JScrollPane(taskTable), BorderLayout.CENTER);
+        tablePanel.setBackground(UITheme.PANEL);
+        tablePanel.setBorder(UITheme.titledBorder("Tasks (concurrent submissions supported)"));
+        JScrollPane tableScroll = new JScrollPane(taskTable);
+        UITheme.scroll(tableScroll);
+        tablePanel.add(tableScroll, BorderLayout.CENTER);
 
         JPanel logPanel = new JPanel(new BorderLayout());
-        logPanel.setBorder(BorderFactory.createTitledBorder("Log"));
-        logPanel.add(new JScrollPane(logArea), BorderLayout.CENTER);
+        logPanel.setBackground(UITheme.PANEL);
+        logPanel.setBorder(UITheme.titledBorder("Log"));
+        JScrollPane logScroll = new JScrollPane(logArea);
+        UITheme.scroll(logScroll);
+        logPanel.add(logScroll, BorderLayout.CENTER);
 
         JSplitPane bottom = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePanel, logPanel);
         bottom.setResizeWeight(0.6);
+        bottom.setBackground(UITheme.BACKGROUND);
 
-        JPanel center = new JPanel(new BorderLayout());
-        center.add(jobInput, BorderLayout.NORTH);
-        center.add(bottom, BorderLayout.CENTER);
-        return center;
+        JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT, top, bottom);
+        main.setResizeWeight(0.38);
+        main.setBackground(UITheme.BACKGROUND);
+        return main;
     }
 
     private void updateHint() {
@@ -169,7 +313,8 @@ public class ClientGUI extends JFrame {
                 : "comma-separated integers  e.g. 12,5,99,2,17");
     }
 
-    /** Connects to the Bootstrap Node and locates the current coordinator worker. */
+    // ---------------------------------------------------------------- connection
+
     private void connect() {
         bootstrapHost = hostField.getText().trim().isEmpty() ? "localhost" : hostField.getText().trim();
         try {
@@ -180,7 +325,7 @@ public class ClientGUI extends JFrame {
         }
 
         connectButton.setEnabled(false);
-        connectionStatus.setForeground(Color.ORANGE);
+        connectionStatus.setForeground(UITheme.WARNING);
         connectionStatus.setText("Connecting...");
         jobExecutor.submit(this::doConnect);
     }
@@ -189,6 +334,8 @@ public class ClientGUI extends JFrame {
         try {
             Registry registry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
             BootstrapService bootstrap = (BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
+            List<WorkerInfo> active = bootstrap.getActiveWorkers();
+            activeWorkerCount = active.size();
             int coordinatorId = findCoordinatorId(bootstrap);
             WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
                     ? null
@@ -197,23 +344,38 @@ public class ClientGUI extends JFrame {
             final int elected = coordinatorId;
             SwingUtilities.invokeLater(() -> {
                 connectButton.setEnabled(true);
-                log("Connected to Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort
-                        + (elected == WorkerService.NO_COORDINATOR ? " - no coordinator elected yet"
-                        : " - coordinator is worker " + elected));
+                workersValue.setText(activeWorkerCount + "/" + WorkerClusterConfig.WORKER_COUNT);
                 if (elected == WorkerService.NO_COORDINATOR) {
-                    connectionStatus.setForeground(Color.ORANGE);
-                    connectionStatus.setText("Connected - no coordinator");
-                    coordinatorLabel.setText("Coordinator: none (run an election)");
+                    connectionStatus.setForeground(UITheme.WARNING);
+                    connectionStatus.setText("Connected - no coordinator yet");
+                    coordinatorLabel.setText("Coordinator: none (workers are electing...)");
+                    coordinatorValue.setText("None");
+                    coordinatorValue.setForeground(UITheme.WARNING);
+                    statusPill.setText("  ●  ELECTING  ");
+                    statusPill.setForeground(UITheme.WARNING);
+                    statusPill.setBorder(BorderFactory.createCompoundBorder(
+                            BorderFactory.createLineBorder(UITheme.WARNING, 2),
+                            BorderFactory.createEmptyBorder(12, 24, 12, 24)));
                 } else {
-                    connectionStatus.setForeground(new Color(0, 128, 0));
-                    connectionStatus.setText("Connected to " + bootstrapHost + ":" + bootstrapPort);
+                    connectionStatus.setForeground(UITheme.SUCCESS);
+                    connectionStatus.setText("Online - coordinator worker " + elected);
                     coordinatorLabel.setText("Coordinator: worker " + elected);
+                    coordinatorValue.setText("Worker " + elected);
+                    coordinatorValue.setForeground(UITheme.SUCCESS);
+                    statusPill.setText("  ●  ONLINE  ");
+                    statusPill.setForeground(UITheme.SUCCESS);
+                    statusPill.setBorder(BorderFactory.createCompoundBorder(
+                            BorderFactory.createLineBorder(UITheme.SUCCESS, 2),
+                            BorderFactory.createEmptyBorder(12, 24, 12, 24)));
                 }
+                log("Connected to Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort
+                        + " - " + activeWorkerCount + " worker(s) registered"
+                        + (elected == WorkerService.NO_COORDINATOR ? ", no coordinator elected yet" : ", coordinator is worker " + elected));
             });
         } catch (Exception e) {
             SwingUtilities.invokeLater(() -> {
                 connectButton.setEnabled(true);
-                connectionStatus.setForeground(Color.RED);
+                connectionStatus.setForeground(UITheme.ERROR);
                 connectionStatus.setText("Connection failed");
                 appendError("Could not connect: " + rootMessage(e));
             });
@@ -260,9 +422,11 @@ public class ClientGUI extends JFrame {
         }
     }
 
+    // ---------------------------------------------------------------- jobs
+
     private void submitJob() {
         if (coordinator == null) {
-            appendError("No coordinator - press Connect (an election must have run)");
+            appendError("No coordinator - press Connect (workers elect one automatically)");
             return;
         }
 
@@ -278,6 +442,7 @@ public class ClientGUI extends JFrame {
         final WorkerService target = coordinator;
 
         addTask(jobId, type, submitted, "Running", String.valueOf(currentCoordinatorId(target)), "-", null);
+        jobsSubmittedValue.setText(String.valueOf(jobSequence.get()));
 
         jobExecutor.submit(() -> {
             try {

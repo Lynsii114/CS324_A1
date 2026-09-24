@@ -10,8 +10,9 @@ across all reachable active workers, merges the partial results and returns the 
 
 Everything ships with two Swing GUIs:
 
-- **ServerGUI** — starts the Bootstrap Node and the four worker processes, triggers elections
-  and shows live cluster state (reachability, JAC, coordinator agreement).
+- **ServerGUI** — starts the Bootstrap Node and the four worker processes and shows a live
+  dashboard (network ONLINE/PARTIAL/OFFLINE, elected coordinator, election status). Workers elect
+  a coordinator **automatically in the background** — no manual trigger needed.
 - **ClientGUI** — submits jobs with manual or CSV input, supports concurrent submissions, and
   tracks each job in a task table. Multiple client GUIs can run at the same time.
 
@@ -77,13 +78,19 @@ messages hop-by-hop over the neighbour ring.
 ## Election & Tie-Breaking Rules
 
 1. Any worker can initiate an election while no coordinator is present.
-2. An `ElectionMessage` (unique `electionId`) floods the neighbour ring; each worker processes a
+2. Every worker runs a small background check (staggered per worker) and quietly starts an
+   election when the cluster has no coordinator. This is automatic: a freshly started cluster
+   elects by itself, and a cluster whose coordinators were reset re-elects within a few seconds —
+   no manual trigger is needed.
+3. An `ElectionMessage` (unique `electionId`) floods the neighbour ring; each worker processes a
    given election id **at most once** (duplicates are dropped), so cycles cannot loop forever.
-3. Each participant contributes a `CandidateInfo` (worker id + JAC) snapshot; echoed participant
+   A per-worker `electionInProgress` guard stops a worker from starting its own election while it
+   is participating in another one.
+4. Each participant contributes a `CandidateInfo` (worker id + JAC) snapshot; echoed participant
    sets are merged back at the initiator, so **every reachable active worker** is considered.
-4. Winner = **lowest JAC**; on a tie the **highest worker ID** wins. With a fresh cluster all
+5. Winner = **lowest JAC**; on a tie the **highest worker ID** wins. With a fresh cluster all
    JACs are `0`, so worker `4` is elected.
-5. The winner is broadcast to all participants and every worker records the same coordinator.
+6. The winner is broadcast to all participants and every worker records the same coordinator.
 
 **Coordinator term:** a coordinator handles at most 5 submitted client jobs per term
 (`jobsThisTerm`, separate from the lifetime JAC). Immediately after the 5th job completes it
@@ -105,6 +112,7 @@ hand-over is refused until the new coordinator is announced.
     |   +-- gui          (ServerGUI - manages the cluster)
     +-- frontend
         +-- client       (ClientGUI - submits jobs)
+        +-- ui           (UITheme - shared dark look-and-feel)
 ```
 
 ## Requirements
@@ -145,14 +153,17 @@ Click **Start Bootstrap**. The status line turns green: `Bootstrap: running ...`
 ### 3. Start the four workers
 
 Click **Start Workers**. The launcher spawns four JVMs (IDs `1..4`, RMI ports `5001..5004`,
-logs `logs/worker-<id>.log`). The state table auto-refreshes every 3 seconds and should show
-`4/4 workers reachable`. Re-running is safe (already-running workers are detected via pid files).
+logs `logs/worker-<id>.log`). The state table auto-refreshes and the dashboard should soon show
+`● ONLINE` with `Workers online: 4/4`. Re-running is safe (already-running workers are detected
+via pid files).
 
-### 4. Run a leader election
+### 4. Wait for the automatic election
 
-Click **Run Election**. The logs show the flood and the winner. With fresh JACs the table shows
-`Coordinator: worker 4` on all four rows. Wait until the green `Network: 4/4 ... | Coordinator: worker 4`
-message appears.
+There is **no election button** — the workers elect a coordinator by themselves. Within ~10
+seconds the dashboard shows `Election: COMPLETE` and **Elected Coordinator: Worker 4** (all JACs
+are `0`, so the highest worker ID wins). The log line `Election complete -> coordinator is worker 4`
+confirms it. If you click **Reset Coordinators**, the workers re-elect themselves a few seconds
+later.
 
 ### 5. Launch one or more Clients
 
@@ -162,9 +173,9 @@ In separate terminals (or more than once from anywhere) run:
 java -cp target/classes com.cs324.frontend.client.ClientGUI
 ```
 
-Click **Connect**. The client auto-discovers the coordinator through the Bootstrap Node and
-shows `Coordinator: worker N`. Pick a job type, type (or load) input, press **Submit**. Multiple
-client GUIs can operate simultaneously.
+Click **Connect**. The client auto-discovers the coordinator through the Bootstrap Node and its
+dashboard shows `● ONLINE` and `Coordinator: Worker N`. Pick a job type, type (or load) input,
+press **Submit**. Multiple client GUIs can operate simultaneously.
 
 ### 6. Submit jobs
 
@@ -198,8 +209,9 @@ Optional trailing args: `WorkerServer <workerId> <port> [bootstrapHost] [bootstr
 
 ### 3. Election
 
-With no coordinator yet, have a worker start the election. Reuse the Server GUI, or run a quick
-RMI call. The Server GUI's **Run Election** button is the simplest supported path.
+Nothing to do — each worker runs a background check and starts an election on its own once it
+sees no coordinator. Start all four workers within a few seconds of each other and the cluster
+self-elects.
 
 ### 4. Client
 
@@ -233,10 +245,11 @@ The coordinator divides the input as evenly as possible across the reachable wor
 ## Observing Internals
 
 - **Worker logs**: `logs/worker-<id>.log` hold the full inter-worker message trail
-  (`ELECTION received`, `ELECTION forwarding`, `dropping duplicate election message ...`,
-  coordinator announcements, and per-slot JAC updates).
-- **Election demonstration**: watch both GUIs/logs — the WinnerAnnouncement must be identical on
-  all four workers for a given election id.
+  (`election ... started`, `ELECTION forwarding`, `dropping duplicate election message ...`,
+  `auto-election result`, coordinator announcements, and per-slot JAC updates).
+- **Election demonstration**: start the workers and watch the Server GUI dashboard flip to
+  `ELECTING...` then `COMPLETE` with the elected node; the WinnerAnnouncement is identical on all
+  four workers for a given election id.
 - **Five-job term change**: submit five jobs through the client; the coordinator log then shows
   `completed 5 jobs this term - ending term and starting a new leader election` and a new
   coordinator is elected (usually a lower-JAC worker).
@@ -257,10 +270,10 @@ The coordinator divides the input as evenly as possible across the reachable wor
 | Symptom | Fix |
 |---------|-----|
 | `Connection refused` on worker/client start | Start the Bootstrap Node first; check the port numbers. |
-| `Cannot accept submission: not the coordinator` | A new term/election is running; press **Run Election** and reconnect the client. |
+| `Cannot accept submission: not the coordinator` | A new term/election is running; reconnect the client after the dashboard shows a new coordinator. |
 | `Coordinator term ended after 5 jobs ...` | Expected — the term expired; the client got the response and the cluster is re-electing. |
 | Port already in use | Another instance is running (pid files skip it); stop it first. |
-| GUI table shows coordinator `mismatch` | Press **Reset Coordinators** then **Run Election** to re- converge. |
+| GUI shows `ELECTING...` for a long time | The workers cannot agree; press **Reset Coordinators** and the workers re-elect automatically. |
 
 ## Known Limitations
 
@@ -269,6 +282,8 @@ The coordinator divides the input as evenly as possible across the reachable wor
 - Worker discovery is centralised in the Bootstrap Node (documented decision); workers that are
   already running keep working if only the Bootstrap Node goes down, but new workers cannot join.
 - The fixed cluster layout is 4 workers (IDs `1..4`, ports `5001..5004`) per the assignment.
+- When starting workers manually one-by-one in separate terminals, start them within a few
+  seconds of each other so the first automatic election covers the whole cluster.
 
 ## Tests
 
