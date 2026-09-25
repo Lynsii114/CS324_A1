@@ -99,7 +99,7 @@ public class ClientGUI extends JFrame {
     }
 
     public ClientGUI() {
-        super("CS324 Distributed Client");
+        super("Distributed Client");
         UITheme.install();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setSize(960, 760);

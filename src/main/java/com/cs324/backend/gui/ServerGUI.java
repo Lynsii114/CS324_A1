@@ -91,7 +91,7 @@ public class ServerGUI extends JFrame {
     }
 
     public ServerGUI() {
-        super("CS324 Cluster Server Manager");
+        super("Server Manager");
         UITheme.install();
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setSize(960, 760);
