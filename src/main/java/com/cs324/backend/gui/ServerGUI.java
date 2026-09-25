@@ -1,5 +1,6 @@
 package com.cs324.backend.gui;
 
+import com.cs324.backend.api.TaskResult;
 import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
 import com.cs324.backend.bootstrap.BootstrapServiceImpl;
@@ -16,6 +17,7 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
+import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
@@ -38,6 +40,7 @@ import java.rmi.server.ExportException;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -57,6 +60,8 @@ import java.util.concurrent.Executors;
 public class ServerGUI extends JFrame {
 
     private static final String[] COLUMNS = {"Worker", "Priority", "Port", "Online", "JAC", "JobsThisTerm", "Coordinator", "Neighbours", "Leaderman"};
+    private static final String[] TASK_COLUMNS = {"Time", "Task", "Client", "Job Type", "Segments", "Workers Used", "Result"};
+    private static final int MAX_TASK_ROWS = 60;
 
     private final JTextField hostField = new JTextField(WorkerClusterConfig.DEFAULT_HOST, 10);
     private final JTextField bootstrapPortField = new JTextField(String.valueOf(BootstrapServer.DEFAULT_PORT), 6);
@@ -76,6 +81,8 @@ public class ServerGUI extends JFrame {
     private final JTextArea logArea = new JTextArea(10, 60);
     private final JTable statusTable = new JTable();
     private final StatusTableModel tableModel = new StatusTableModel();
+    private final JTable taskTable = new JTable();
+    private final TaskDistributionModel taskModel = new TaskDistributionModel();
 
     private final ExecutorService executor = Executors.newFixedThreadPool(2, runnable -> {
         Thread thread = new Thread(runnable, "server-gui-worker");
@@ -159,6 +166,8 @@ public class ServerGUI extends JFrame {
         UITheme.textArea(logArea);
         UITheme.table(statusTable);
         statusTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        UITheme.table(taskTable);
+        taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
     }
 
     // ---------------------------------------------------------------- dashboard
@@ -281,11 +290,23 @@ public class ServerGUI extends JFrame {
     }
 
     private Component buildMain() {
-        JPanel tablePanel = new JPanel(new BorderLayout());
-        tablePanel.setBackground(UITheme.PANEL);
-        JScrollPane tableScroll = new JScrollPane(statusTable);
-        UITheme.scroll(tableScroll);
-        tablePanel.add(tableScroll, BorderLayout.CENTER);
+        JPanel statusPanel = new JPanel(new BorderLayout());
+        statusPanel.setBackground(UITheme.PANEL);
+        JScrollPane statusScroll = new JScrollPane(statusTable);
+        UITheme.scroll(statusScroll);
+        statusPanel.add(statusScroll, BorderLayout.CENTER);
+
+        JPanel taskPanel = new JPanel(new BorderLayout());
+        taskPanel.setBackground(UITheme.PANEL);
+        JScrollPane taskScroll = new JScrollPane(taskTable);
+        UITheme.scroll(taskScroll);
+        taskPanel.add(taskScroll, BorderLayout.CENTER);
+
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.setFont(UITheme.BASE);
+        tabs.setBackground(UITheme.BACKGROUND);
+        tabs.addTab("Worker Status", statusPanel);
+        tabs.addTab("Client Task Distribution", taskPanel);
 
         JPanel logPanel = new JPanel(new BorderLayout());
         logPanel.setBackground(UITheme.PANEL);
@@ -293,8 +314,8 @@ public class ServerGUI extends JFrame {
         UITheme.scroll(logScroll);
         logPanel.add(logScroll, BorderLayout.CENTER);
 
-        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePanel, logPanel);
-        split.setResizeWeight(0.55);
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tabs, logPanel);
+        split.setResizeWeight(0.62);
         split.setBackground(UITheme.BACKGROUND);
         split.setBorder(UITheme.titledBorder("Cluster State (auto-refreshes)"));
 
@@ -444,8 +465,34 @@ public class ServerGUI extends JFrame {
         final boolean agreed = coordinators.size() == 1 && !coordinators.contains(WorkerService.NO_COORDINATOR);
         final int elected = agreed ? coordinators.iterator().next() : WorkerService.NO_COORDINATOR;
 
+        List<TaskResult> mergedTasks = new ArrayList<>();
+        for (int workerId : WorkerClusterConfig.workerIds()) {
+            try {
+                mergedTasks.addAll(lookupWorker(workerId).getTaskHistory());
+            } catch (Exception e) {
+                // worker unreachable - skip its (unavailable) history
+            }
+        }
+        mergedTasks.sort((a, b) -> Long.compare(b.getCompletedAtMillis(), a.getCompletedAtMillis()));
+        if (mergedTasks.size() > MAX_TASK_ROWS) {
+            mergedTasks = new ArrayList<>(mergedTasks.subList(0, MAX_TASK_ROWS));
+        }
+        List<Object[]> taskRows = new ArrayList<>();
+        for (TaskResult task : mergedTasks) {
+            taskRows.add(new Object[]{
+                    LocalTime.ofNanoOfDay(task.getCompletedAtMillis() % (24L * 60 * 60 * 1000) * 1000_000L)
+                            .format(DateTimeFormatter.ofPattern("HH:mm:ss")),
+                    shortTaskId(task.getTaskId()),
+                    task.getClientId(),
+                    task.getJobType(),
+                    task.getSegmentCount(),
+                    joinWorkerIds(task.getWorkerIds()) + " (of " + task.getCoordinatorId() + ")",
+                    task.getResult()});
+        }
+
         SwingUtilities.invokeLater(() -> {
             tableModel.setRows(rows);
+            taskModel.setRows(taskRows);
             updateDashboard(reachableCount, total, agreed, elected,
                     coordinators.contains(WorkerService.NO_COORDINATOR));
             if (elected != previousCoordinator) {
@@ -538,6 +585,24 @@ public class ServerGUI extends JFrame {
         JOptionPane.showMessageDialog(this, message, "Error", JOptionPane.ERROR_MESSAGE);
     }
 
+    private static String shortTaskId(String taskId) {
+        return taskId != null && taskId.length() > 8 ? taskId.substring(0, 8) : String.valueOf(taskId);
+    }
+
+    private static String joinWorkerIds(List<Integer> workerIds) {
+        if (workerIds == null || workerIds.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < workerIds.size(); i++) {
+            if (i > 0) {
+                builder.append(",");
+            }
+            builder.append(workerIds.get(i));
+        }
+        return builder.toString();
+    }
+
     private static final class StatusTableModel extends AbstractTableModel {
         private final List<Object[]> rows = new ArrayList<>();
 
@@ -554,6 +619,36 @@ public class ServerGUI extends JFrame {
         @Override
         public String getColumnName(int column) {
             return COLUMNS[column];
+        }
+
+        @Override
+        public Object getValueAt(int rowIndex, int columnIndex) {
+            return rows.get(rowIndex)[columnIndex];
+        }
+
+        void setRows(List<Object[]> rows) {
+            this.rows.clear();
+            this.rows.addAll(rows);
+            fireTableDataChanged();
+        }
+    }
+
+    private static final class TaskDistributionModel extends AbstractTableModel {
+        private final List<Object[]> rows = new ArrayList<>();
+
+        @Override
+        public int getRowCount() {
+            return rows.size();
+        }
+
+        @Override
+        public int getColumnCount() {
+            return TASK_COLUMNS.length;
+        }
+
+        @Override
+        public String getColumnName(int column) {
+            return TASK_COLUMNS[column];
         }
 
         @Override

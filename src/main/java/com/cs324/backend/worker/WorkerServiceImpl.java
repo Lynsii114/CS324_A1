@@ -4,6 +4,7 @@ import com.cs324.backend.api.BootstrapService;
 import com.cs324.backend.api.CandidateInfo;
 import com.cs324.backend.api.ElectionMessage;
 import com.cs324.backend.api.ProcessedParticipants;
+import com.cs324.backend.api.TaskResult;
 import com.cs324.backend.api.WinnerAnnouncement;
 import com.cs324.backend.api.WorkerInfo;
 import com.cs324.backend.api.WorkerService;
@@ -17,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -27,6 +29,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -114,6 +117,15 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final AtomicInteger jobsThisTerm = new AtomicInteger(0);
 
     private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
+
+    /**
+     * Recent distributed-task records compiled while this worker acted as the
+     * coordinator, newest first. Thread-safe under concurrent client jobs (the
+     * coordinator can serve several clients at once); capped to the newest
+     * {@link #MAX_TASK_HISTORY} records so the JVM does not accumulate them.
+     */
+    private static final int MAX_TASK_HISTORY = 50;
+    private final Deque<TaskResult> taskHistory = new ConcurrentLinkedDeque<>();
 
     /** Startup-lottery priority id (1..6); 6 = highest. Minted at boot by the
      * randomized countdown lottery and used as the election tie-breaker. */
@@ -558,14 +570,32 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
-    public int submitMaxJob(List<Integer> numbers) throws RemoteException {
+    public List<TaskResult> getTaskHistory() throws RemoteException {
+        return new ArrayList<>(taskHistory);
+    }
+
+    /**
+     * Appends one completed distributed task to this worker's history (newest
+     * first), trimming to {@link #MAX_TASK_HISTORY} records. Called only by the
+     * coordinator after it merges the partial results of a client job.
+     */
+    private void recordTask(TaskResult record) {
+        taskHistory.addFirst(record);
+        while (taskHistory.size() > MAX_TASK_HISTORY) {
+            taskHistory.pollLast();
+        }
+    }
+
+    @Override
+    public TaskResult submitMaxJob(String clientId, List<Integer> numbers) throws RemoteException {
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
         requireCoordinator();
 
         int termSlot = claimTermSlot();
-        return runJob(termSlot, () -> executeSubmitMaxJob(numbers));
+        String taskId = UUID.randomUUID().toString();
+        return runJob(termSlot, () -> executeSubmitMaxJob(taskId, clientId, numbers));
     }
 
     /**
@@ -693,15 +723,17 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         return new RemoteException("Job failed: " + cause, cause);
     }
 
-    private int executeSubmitMaxJob(List<Integer> numbers) throws RemoteException {
-        List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int segmentCount = segmentCountFor(reachableWorkers.size(), numbers.size(), SEGMENT_NUMBERS);
+    private TaskResult executeSubmitMaxJob(String taskId, String clientId, List<Integer> numbers) throws RemoteException {
+        List<WorkerService> assignees = getAssignmentWorkers();
+        int segmentCount = segmentCountFor(assignees.size(), numbers.size(), SEGMENT_NUMBERS);
         if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for MAX job");
         }
 
-        System.out.println("[Worker " + workerId + "] MAX job received -> numbers="
-                + numbers + ", reachableWorkers=" + reachableWorkers.size()
+        long startedAt = System.currentTimeMillis();
+        List<Integer> usedWorkers = new ArrayList<>();
+        System.out.println("[Worker " + workerId + "] MAX task " + taskId + " (" + clientId
+                + ") -> numbers=" + numbers.size() + " items, reachableWorkers=" + assignees.size()
                 + ", segments=" + segmentCount);
 
         int finalMax = Integer.MIN_VALUE;
@@ -711,21 +743,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             int remainingSegments = segmentCount - index;
             int chunkSize = (remainingNumbers + remainingSegments - 1) / remainingSegments;
             List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
-            WorkerService worker = reachableWorkers.get(index);
+            WorkerService worker = assignees.get(index);
             int targetId = readWorkerId(worker);
+            usedWorkers.add(targetId);
 
             // Phase 2 JAC tracking: the worker chosen to process this segment
             // has its own local JAC incremented by the coordinator.
             worker.recordJobAllocation();
 
             try {
-                System.out.println("[Worker " + workerId + "] MAX assigning -> toWorkerId="
-                        + targetId + ", section=" + chunk);
+                System.out.println("[Worker " + workerId + "] MAX task " + taskId + " segment "
+                        + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
+                        + ", section=" + chunk);
                 int partialMax = worker.computePartialMax(chunk);
                 finalMax = Math.max(finalMax, partialMax);
-                System.out.println("[Worker " + workerId + "] MAX partial result <- fromWorkerId="
-                        + targetId + ", partialMax=" + partialMax
-                        + ", currentFinalMax=" + finalMax);
+                System.out.println("[Worker " + workerId + "] MAX task " + taskId + " partial <- "
+                        + targetId + ": " + partialMax + ", running=" + finalMax);
             } catch (Exception e) {
                 throw new RemoteException("MAX job failed while assigning worker "
                         + targetId, e);
@@ -734,8 +767,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             start += chunkSize;
         }
 
-        System.out.println("[Worker " + workerId + "] MAX final result -> max=" + finalMax);
-        return finalMax;
+        TaskResult record = new TaskResult(taskId, clientId, "MAX", finalMax, segmentCount,
+                usedWorkers, workerId, startedAt, System.currentTimeMillis());
+        recordTask(record);
+        System.out.println("[Worker " + workerId + "] MAX task " + taskId + " complete -> result="
+                + finalMax + ", workers=" + usedWorkers);
+        return record;
     }
 
     @Override
@@ -764,25 +801,28 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
-    public int submitPrimeCount(List<Integer> numbers) throws RemoteException {
+    public TaskResult submitPrimeCount(String clientId, List<Integer> numbers) throws RemoteException {
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
         requireCoordinator();
 
         int termSlot = claimTermSlot();
-        return runJob(termSlot, () -> executeSubmitPrimeCount(numbers));
+        String taskId = UUID.randomUUID().toString();
+        return runJob(termSlot, () -> executeSubmitPrimeCount(taskId, clientId, numbers));
     }
 
-    private int executeSubmitPrimeCount(List<Integer> numbers) throws RemoteException {
-        List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int segmentCount = segmentCountFor(reachableWorkers.size(), numbers.size(), SEGMENT_NUMBERS);
+    private TaskResult executeSubmitPrimeCount(String taskId, String clientId, List<Integer> numbers) throws RemoteException {
+        List<WorkerService> assignees = getAssignmentWorkers();
+        int segmentCount = segmentCountFor(assignees.size(), numbers.size(), SEGMENT_NUMBERS);
         if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for PRIMECOUNT job");
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMECOUNT job received -> numbers="
-                + numbers + ", reachableWorkers=" + reachableWorkers.size()
+        long startedAt = System.currentTimeMillis();
+        List<Integer> usedWorkers = new ArrayList<>();
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT task " + taskId + " (" + clientId
+                + ") -> numbers=" + numbers.size() + " items, reachableWorkers=" + assignees.size()
                 + ", segments=" + segmentCount);
 
         int totalPrimes = 0;
@@ -792,21 +832,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             int remainingSegments = segmentCount - index;
             int chunkSize = (remainingNumbers + remainingSegments - 1) / remainingSegments;
             List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
-            WorkerService worker = reachableWorkers.get(index);
+            WorkerService worker = assignees.get(index);
             int targetId = readWorkerId(worker);
+            usedWorkers.add(targetId);
 
             // Phase 2 JAC tracking: the worker chosen to process this segment
             // has its own local JAC incremented by the coordinator.
             worker.recordJobAllocation();
 
             try {
-                System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
-                        + targetId + ", section=" + chunk);
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT task " + taskId + " segment "
+                        + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
+                        + ", section=" + chunk);
                 int partialCount = worker.countPrimes(chunk);
                 totalPrimes += partialCount;
-                System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
-                        + targetId + ", primes=" + partialCount
-                        + ", runningTotal=" + totalPrimes);
+                System.out.println("[Worker " + workerId + "] PRIMECOUNT task " + taskId + " partial <- "
+                        + targetId + ": " + partialCount + ", running=" + totalPrimes);
             } catch (Exception e) {
                 throw new RemoteException("PRIMECOUNT job failed while assigning worker "
                         + targetId, e);
@@ -815,8 +856,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             start += chunkSize;
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMECOUNT final result -> primes=" + totalPrimes);
-        return totalPrimes;
+        TaskResult record = new TaskResult(taskId, clientId, "PRIMECOUNT", totalPrimes, segmentCount,
+                usedWorkers, workerId, startedAt, System.currentTimeMillis());
+        recordTask(record);
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT task " + taskId + " complete -> result="
+                + totalPrimes + ", workers=" + usedWorkers);
+        return record;
     }
 
     @Override
@@ -841,25 +886,28 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     @Override
-    public long submitPrimeSum(int start, int end) throws RemoteException {
+    public TaskResult submitPrimeSum(String clientId, int start, int end) throws RemoteException {
         if (start < 1 || end < start) {
             throw new IllegalArgumentException("invalid range: start=" + start + ", end=" + end);
         }
         requireCoordinator();
 
         int termSlot = claimTermSlot();
-        return runJob(termSlot, () -> executeSubmitPrimeSum(start, end));
+        String taskId = UUID.randomUUID().toString();
+        return runJob(termSlot, () -> executeSubmitPrimeSum(taskId, clientId, start, end));
     }
 
-    private long executeSubmitPrimeSum(int start, int end) throws RemoteException {
-        List<WorkerService> reachableWorkers = getReachableWorkerServices();
-        int segmentCount = segmentCountFor(reachableWorkers.size(), end - start + 1, SEGMENT_RANGE_LENGTH);
+    private TaskResult executeSubmitPrimeSum(String taskId, String clientId, int start, int end) throws RemoteException {
+        List<WorkerService> assignees = getAssignmentWorkers();
+        int segmentCount = segmentCountFor(assignees.size(), end - start + 1, SEGMENT_RANGE_LENGTH);
         if (segmentCount == 0) {
             throw new RemoteException("No reachable workers are available for PRIMESUM job");
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMESUM job received -> start=" + start
-                + ", end=" + end + ", reachableWorkers=" + reachableWorkers.size()
+        long startedAt = System.currentTimeMillis();
+        List<Integer> usedWorkers = new ArrayList<>();
+        System.out.println("[Worker " + workerId + "] PRIMESUM task " + taskId + " (" + clientId
+                + ") -> range=[" + start + ", " + end + "], reachableWorkers=" + assignees.size()
                 + ", segments=" + segmentCount);
 
         long totalSum = 0;
@@ -870,20 +918,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             int chunkSize = (remainingLength + remainingSegments - 1) / remainingSegments;
             int segmentEnd = segmentStart + chunkSize - 1;
 
-            WorkerService worker = reachableWorkers.get(index);
+            WorkerService worker = assignees.get(index);
             int targetId = readWorkerId(worker);
+            usedWorkers.add(targetId);
 
             // Phase 2 JAC tracking: the worker chosen to process this segment
             // has its own local JAC incremented by the coordinator.
             worker.recordJobAllocation();
 
             try {
-                System.out.println("[Worker " + workerId + "] PRIMESUM assigning -> toWorkerId="
-                        + targetId + ", range=[" + segmentStart + ", " + segmentEnd + "]");
+                System.out.println("[Worker " + workerId + "] PRIMESUM task " + taskId + " segment "
+                        + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
+                        + ", range=[" + segmentStart + ", " + segmentEnd + "]");
                 long partialSum = worker.sumPrimeRange(segmentStart, segmentEnd);
                 totalSum += partialSum;
-                System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
-                        + targetId + ", sum=" + partialSum + ", runningTotal=" + totalSum);
+                System.out.println("[Worker " + workerId + "] PRIMESUM task " + taskId + " partial <- "
+                        + targetId + ": " + partialSum + ", running=" + totalSum);
             } catch (Exception e) {
                 throw new RemoteException("PRIMESUM job failed while assigning worker "
                         + targetId, e);
@@ -892,8 +942,12 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             segmentStart = segmentEnd + 1;
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMESUM final result -> sum=" + totalSum);
-        return totalSum;
+        TaskResult record = new TaskResult(taskId, clientId, "PRIMESUM", totalSum, segmentCount,
+                usedWorkers, workerId, startedAt, System.currentTimeMillis());
+        recordTask(record);
+        System.out.println("[Worker " + workerId + "] PRIMESUM task " + taskId + " complete -> result="
+                + totalSum + ", workers=" + usedWorkers);
+        return record;
     }
 
     @Override
@@ -1112,6 +1166,30 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 .thenComparing(Comparator.comparingInt((WorkerService s) -> readPriority(s)).reversed())
                 .thenComparingInt((WorkerService s) -> readWorkerId(s)));
         return services;
+    }
+
+    /**
+     * The workers a coordinator may hand segments of a client task to: the
+     * reachable set from {@link #getReachableWorkerServices()} with the
+     * coordinator itself moved to the end of the ranking. The least-loaded
+     * worker nodes are preferred first, so each client's task spreads over a
+     * different subset of workers as the JACs diverge, and the coordinator only
+     * processes a segment itself when a task is big enough to need every
+     * reachable worker (segment count == active workers).
+     */
+    private List<WorkerService> getAssignmentWorkers() throws RemoteException {
+        List<WorkerService> reachable = getReachableWorkerServices();
+        List<WorkerService> others = new ArrayList<>();
+        List<WorkerService> self = new ArrayList<>();
+        for (WorkerService worker : reachable) {
+            if (readWorkerId(worker) == workerId) {
+                self.add(worker);
+            } else {
+                others.add(worker);
+            }
+        }
+        others.addAll(self);
+        return others;
     }
 
     private int readPriority(WorkerService service) {

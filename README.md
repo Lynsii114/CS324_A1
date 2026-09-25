@@ -5,10 +5,12 @@
 This project is a distributed computing cluster built with **Java RMI**. These are **six independent worker processes** connected in an unstructured network, a neutral
 **Bootstrap Node** tracking membership, and a distributed **leader election** that lets the
 workers agree on a **Coordinator** for one term at a time. Clients submit jobs (MAX, PRIMECOUNT,
-PRIMESUM); the coordinator re-splits the work into a **variable number of contiguous segments**
-(based on the task size) and RANKS the workers by **JAC** (lowest first) so the least-loaded nodes
-get work first — each worker that processes a segment has its own JAC incremented — merges the
-partial results and returns the final answer.
+PRIMESUM); the coordinator tags each client request with a **task ID**, re-splits the work into a
+**variable number of contiguous segments** (based on the task size) and RANKS the workers by **JAC**
+(lowest first) — with the coordinator itself ranked **last**, so the least-loaded worker *nodes*
+get work first and the coordinator only processes a segment itself when the task is big enough to
+need every reachable worker — merges the partial results, records exactly which workers processed
+each task, and returns the final answer plus the used-worker list to the requesting client.
 
 Each worker runs in its own JVM with its own RMI registry port, its own log file and its own
 pid file. Workers only know their direct neighbours (a ring backbone built from the Bootstrap
@@ -42,9 +44,14 @@ hop-by-hop over the neighbour graph.
   startup lottery and in elections, and runs distributed computations. Tracks a lifetime **JAC**
   (segments processed) and a per-term submitted-job counter.
 - **Coordinator** — a worker elected for one term. Receives jobs from clients, finds reachable
-  active workers, splits each task into segments of a fixed maximum size, hands them to the
-  lowest-JAC workers (incrementing the receiving worker's JAC), combines partial results, assigns
-  at most **five jobs per term**, then broadcasts Term_End and steps down.
+  active workers, assigns each task a unique **task ID**, splits it into segments of a fixed
+  maximum size, hands the segments to the lowest-JAC workers in order (ranking itself **last**, so
+  other nodes are preferred and it only takes a segment when every reachable worker already has
+  one; each receiving worker's JAC is incremented), combines partial results into a `TaskResult`
+  that records the task ID, client ID, segment count, the exact worker list used and the merged
+  answer — then returns it to the client and keeps a short history of compiled tasks for the Server
+  Manager's *Client Task Distribution* view. Assigns at most **five jobs per term**, then broadcasts
+  Term_End and steps down.
 - **Client** — a separate process with a GUI that accepts manual or CSV input and submits jobs
   concurrently.
 
@@ -72,9 +79,12 @@ The election protocol runs in three phases.
 6. Each submitted task is split into a **variable number of contiguous segments**:
    `max(1, min(activeWorkers, ⌈items / maxItemsPerSegment⌉))`. A large PRIMESUM spreads over many
    workers, a small one over one or two — segment counts differ from task to task.
-7. Each segment is handed to the lowest-JAC worker, and **that worker's own JAC is incremented**
-   (including for a segment the coordinator keeps itself). The coordinator can therefore process
-   several clients concurrently, and the JAC values diverge naturally with workload.
+7. The coordinator tags the request with a unique **task ID**, then hands each segment to the
+   lowest-JAC worker **with itself ranked last**: it only keeps a segment when the task needs every
+   reachable worker. **Each receiving worker's own JAC is incremented.** Because the JACs diverge,
+   tasks from different clients tend to reach different subsets of worker nodes. The coordinator
+   merges the partial results into a `TaskResult` (task ID, client ID, job type, segment count,
+   the exact worker list used, the merged answer) and returns it to the requesting client.
 
 ### Phase 3 — Term Expiration & Lowest-JAC Re-Election
 
@@ -159,7 +169,7 @@ Click **Start Bootstrap**. The status line turns green: `Bootstrap: running ...`
 Click **Start Workers**. The launcher spawns six JVMs (IDs `1..6`, RMI ports `5001..5006`,
 logs `logs/worker-<id>.log`). The state table auto-refreshes and the dashboard should soon show
 `● ONLINE` with `Workers online: 6/6`. Re-running is safe (already-running workers are detected
-via pid files).
+via pid files and RMI probes, so no duplicate processes are spawned).
 
 ### 4. Wait for the automatic election
 
@@ -182,7 +192,16 @@ Click **Connect**. The client auto-discovers the coordinator through the Bootstr
 dashboard shows `● ONLINE` and `Coordinator: Worker N`. Pick a job type, type (or load) input,
 press **Submit**. Multiple client GUIs can operate simultaneously.
 
-### 6. Submit jobs
+### 6. Watch task distribution in the Server Manager
+
+The Server Manager keeps two auto-refreshing tabs. **Worker Status** shows per-worker online state,
+JAC, `jobsThisTerm`, agreement on the coordinator and neighbours. **Client Task Distribution** shows
+the tasks each coordinator has compiled: timestamp, task ID (first 8 chars), the **client** that
+asked for it, job type, segment count, and the exact **worker nodes** that processed its segments
+(plus the coordinator that compiled it) and the merged result. Different clients therefore show up
+side by side with their distinct worker lists.
+
+### 7. Submit jobs
 
 See [Job Types & Input Formats](#job-types--input-formats) below.
 
@@ -245,11 +264,13 @@ Malformed values (non-numeric, empty, `start > end`, `start < 1`) produce a clea
 task table instead of crashing.
 
 The coordinator splits each task into a **variable number of contiguous segments** for the
-reachable workers — MAX/PRIMECOUNT use `⌈n / 3⌉` segments, PRIMESUM uses `⌈range / 200⌉` —
-ranking workers by **JAC** (least-loaded first) and incrementing the receiving worker's JAC for
-each segment. A fresh `PRIMESUM(1, 1000)` therefore splits into five ranges of ~200 numbers and a
-10-number MAX into four groups. Partial results are merged back at the coordinator, which returns
-the final answer to the requesting client.
+reachable workers — MAX/PRIMECOUNT use `⌈n / 3⌉` segments, PRIMESUM uses `⌈range / 200⌉` — ranking
+workers by **JAC** (least-loaded first, the coordinator itself last) and incrementing the receiving
+worker's JAC for each segment. A fresh `PRIMESUM(1, 1000)` therefore splits into five ranges of
+~200 numbers and a 10-number MAX into four groups. Partial results are merged back at the
+coordinator, which attaches the task ID (assigned when the client submitted), the client that asked
+for it, and the list of workers used for that task, and returns the compiled answer to the client.
+The client's task table shows the task's short ID, the workers that ran it, and the final result.
 
 ### Ready-made sample CSV files
 

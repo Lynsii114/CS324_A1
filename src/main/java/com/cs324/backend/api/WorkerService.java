@@ -80,25 +80,42 @@ public interface WorkerService extends Remote {
     /** Records the elected coordinator for a finished election. */
     void announceWinner(WinnerAnnouncement announcement) throws RemoteException;
 
-    int submitMaxJob(List<Integer> numbers) throws RemoteException;
+    /**
+     * Distributes a MAX job across reachable workers and returns the compiled
+     * result to the client. {@code clientId} identifies the submitting client;
+     * the coordinator generates a unique task id and records which workers
+     * processed each segment in the returned {@link TaskResult}.
+     */
+    TaskResult submitMaxJob(String clientId, List<Integer> numbers) throws RemoteException;
 
     int computePartialMax(List<Integer> numbers) throws RemoteException;
 
-    /** Distributes a PRIMECOUNT job across reachable workers. Coordinator only. */
-    int submitPrimeCount(List<Integer> numbers) throws RemoteException;
+    /**
+     * Distributes a PRIMECOUNT job across reachable workers. Coordinator only.
+     * Returns a {@link TaskResult} with the number of primes (duplicates count)
+     * and the workers that handled the segments.
+     */
+    TaskResult submitPrimeCount(String clientId, List<Integer> numbers) throws RemoteException;
 
     /** Computes the number of primes in a section assigned by the coordinator. */
     int countPrimes(List<Integer> numbers) throws RemoteException;
 
     /**
      * Distributes a PRIMESUM job across reachable workers. Coordinator only.
-     * Returns the sum of all prime numbers in the inclusive range
-     * {@code [start, end]}.
+     * Returns a {@link TaskResult} with the sum of all prime numbers in the
+     * inclusive range {@code [start, end]} and the workers used per segment.
      */
-    long submitPrimeSum(int start, int end) throws RemoteException;
+    TaskResult submitPrimeSum(String clientId, int start, int end) throws RemoteException;
 
     /** Computes the sum of the primes in the inclusive range assigned by the coordinator. */
     long sumPrimeRange(int start, int end) throws RemoteException;
+
+    /**
+     * Recent distributed-task records this worker produced while acting as the
+     * coordinator (newest first). Used by the Server Manager to show which
+     * worker nodes processed the tasks of different clients.
+     */
+    List<TaskResult> getTaskHistory() throws RemoteException;
 
     /**
      * Term-End notification from a stepping-down coordinator, carrying its final

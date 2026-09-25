@@ -41,6 +41,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -57,7 +58,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ClientGUI extends JFrame {
 
     private static final String[] JOB_TYPES = {"MAX", "PRIMECOUNT", "PRIMESUM"};
-    private static final String[] COLUMNS = {"Job ID", "Type", "Submitted", "Status", "Coordinator", "Result", "Error"};
+    private static final String[] COLUMNS = {"Job ID", "Type", "Submitted", "Status", "Coordinator", "Workers", "Result", "Error"};
 
     private final JTextField hostField = new JTextField("localhost", 10);
     private final JTextField bootstrapPortField = new JTextField(String.valueOf(BootstrapServer.DEFAULT_PORT), 6);
@@ -87,6 +88,13 @@ public class ClientGUI extends JFrame {
         return thread;
     });
     private final AtomicInteger jobSequence = new AtomicInteger(0);
+
+    /**
+     * This client's identifier. Sent with every submission so the elected
+     * coordinator can correlate the distributed task back to the client that
+     * asked for it (visible in the Server Manager's task distribution view).
+     */
+    private final String clientId = "client-" + UUID.randomUUID().toString().substring(0, 8);
 
     private volatile String bootstrapHost = "localhost";
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
@@ -123,7 +131,8 @@ public class ClientGUI extends JFrame {
         jobTypeCombo.addActionListener(e -> updateHint());
 
         updateHint();
-        log("Client ready. Connect to the Bootstrap Node, then submit jobs (they run in the background).");
+        log("Client ready (" + clientId + "). Connect to the Bootstrap Node, then submit jobs "
+                + "(they run in the background).");
     }
 
     private void style() {
@@ -481,15 +490,17 @@ public class ClientGUI extends JFrame {
         final String submitted = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
         final WorkerService target = coordinator;
 
-        addTask(jobId, type, submitted, "Running", String.valueOf(currentCoordinatorId(target)), "-", null);
+        addTask(jobId, type, submitted, "Running", String.valueOf(currentCoordinatorId(target)), "-", "-", null);
         jobsSubmittedValue.setText(String.valueOf(jobSequence.get()));
 
         jobExecutor.submit(() -> {
             WorkerService targetWorker = target;
             for (int attempt = 0; attempt < 3; attempt++) {
                 try {
-                    Object result = dispatch(targetWorker, type, raw);
-                    updateTask(jobId, "Done", result.toString(), null);
+                    com.cs324.backend.api.TaskResult result = dispatch(targetWorker, type, raw);
+                    String workers = joinWorkerIds(result.getWorkerIds());
+                    String resultText = "task=" + shortTaskId(result.getTaskId()) + " result=" + result.getResult();
+                    updateTask(jobId, "Done", workers, resultText, null);
                     log("Job " + jobId + " [" + type + "] finished -> " + result);
                     return;
                 } catch (Exception e) {
@@ -506,7 +517,8 @@ public class ClientGUI extends JFrame {
                         }
                         continue;
                     }
-                    updateTask(jobId, "Failed", "-", coordinatorChanged ? message + " (coordinator re-elected)" : message);
+                    updateTask(jobId, "Failed", "-", "-",
+                            coordinatorChanged ? message + " (coordinator re-elected)" : message);
                     log("Job " + jobId + " [" + type + "] failed -> " + message);
                     return;
                 }
@@ -528,18 +540,36 @@ public class ClientGUI extends JFrame {
                 || message.contains("Coordinator term ended"));
     }
 
-    private Object dispatch(WorkerService target, String type, String raw) throws Exception {
+    private com.cs324.backend.api.TaskResult dispatch(WorkerService target, String type, String raw) throws Exception {
         switch (type) {
             case "MAX":
-                return target.submitMaxJob(parseNumbers(raw));
+                return target.submitMaxJob(clientId, parseNumbers(raw));
             case "PRIMECOUNT":
-                return target.submitPrimeCount(parseNumbers(raw));
+                return target.submitPrimeCount(clientId, parseNumbers(raw));
             case "PRIMESUM":
                 int[] range = parseRange(raw);
-                return target.submitPrimeSum(range[0], range[1]);
+                return target.submitPrimeSum(clientId, range[0], range[1]);
             default:
                 throw new IllegalArgumentException("Unknown job type: " + type);
         }
+    }
+
+    private static String joinWorkerIds(List<Integer> workerIds) {
+        if (workerIds == null || workerIds.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < workerIds.size(); i++) {
+            if (i > 0) {
+                builder.append(",");
+            }
+            builder.append(workerIds.get(i));
+        }
+        return builder.toString();
+    }
+
+    private static String shortTaskId(String taskId) {
+        return taskId != null && taskId.length() > 8 ? taskId.substring(0, 8) : String.valueOf(taskId);
     }
 
     private void loadCsv() {
@@ -601,12 +631,12 @@ public class ClientGUI extends JFrame {
         return message == null ? current.getClass().getSimpleName() : message;
     }
 
-    private void addTask(int jobId, String type, String submitted, String status, String coordinator, String result, String error) {
-        SwingUtilities.invokeLater(() -> tableModel.addRow(jobId, type, submitted, status, coordinator, result, error));
+    private void addTask(int jobId, String type, String submitted, String status, String coordinator, String workers, String result, String error) {
+        SwingUtilities.invokeLater(() -> tableModel.addRow(jobId, type, submitted, status, coordinator, workers, result, error));
     }
 
-    private void updateTask(int jobId, String status, String result, String error) {
-        SwingUtilities.invokeLater(() -> tableModel.updateRow(jobId, status, result, error));
+    private void updateTask(int jobId, String status, String workers, String result, String error) {
+        SwingUtilities.invokeLater(() -> tableModel.updateRow(jobId, status, workers, result, error));
     }
 
     private void log(String message) {
@@ -648,17 +678,18 @@ public class ClientGUI extends JFrame {
             return false;
         }
 
-        void addRow(int jobId, String type, String submitted, String status, String coordinator, String result, String error) {
-            rows.add(new Object[]{jobId, type, submitted, status, coordinator, result, error});
+        void addRow(int jobId, String type, String submitted, String status, String coordinator, String workers, String result, String error) {
+            rows.add(new Object[]{jobId, type, submitted, status, coordinator, workers, result, error});
             fireTableRowsInserted(rows.size() - 1, rows.size() - 1);
         }
 
-        void updateRow(int jobId, String status, String result, String error) {
+        void updateRow(int jobId, String status, String workers, String result, String error) {
             for (int i = 0; i < rows.size(); i++) {
                 if ((Integer) rows.get(i)[0] == jobId) {
                     rows.get(i)[3] = status;
-                    rows.get(i)[5] = result;
-                    rows.get(i)[6] = error;
+                    rows.get(i)[5] = workers;
+                    rows.get(i)[6] = result;
+                    rows.get(i)[7] = error;
                     fireTableRowsUpdated(i, i);
                     return;
                 }
