@@ -12,7 +12,10 @@ import java.nio.file.Paths;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Launches the six configured Worker Nodes (IDs 1-6) as six independent JVM
@@ -48,7 +51,7 @@ public final class WorkerClusterLauncher {
         }
     }
 
-    public static void start(String bootstrapHost, int bootstrapPort) throws Exception {
+    public static List<Integer> start(String bootstrapHost, int bootstrapPort) throws Exception {
         Path logDir = Paths.get(WorkerClusterConfig.LOG_DIR);
         Files.createDirectories(logDir);
 
@@ -69,6 +72,25 @@ public final class WorkerClusterLauncher {
             }
 
             int port = WorkerClusterConfig.portFor(workerId);
+            if (isReachableOverRmi(workerId, bootstrapHost)) {
+                // A worker is already serving this port, but the pid file is stale or was
+                // never written (e.g. launched manually, or left over from a previous
+                // Server Manager session). Do not spawn a duplicate; reclaim its tracking
+                // so Start/Stop stay consistent.
+                alreadyRunning.add(workerId);
+                List<Long> orphans = findRunningPids(workerId, port);
+                if (!orphans.isEmpty()) {
+                    Files.writeString(pidFile, String.valueOf(orphans.get(0)), StandardCharsets.UTF_8);
+                    System.out.println("Worker " + workerId + " already serving port " + port
+                            + " (pid " + orphans.get(0) + ") - not started twice");
+                } else {
+                    deleteQuietly(pidFile);
+                    System.out.println("Worker " + workerId + " already serving port " + port
+                            + " (unmanaged process) - not started twice");
+                }
+                continue;
+            }
+
             ProcessBuilder builder = new ProcessBuilder(
                     javaBin,
                     "-cp", classpath,
@@ -97,6 +119,7 @@ public final class WorkerClusterLauncher {
         System.out.println("Cluster state: " + (started.size() + alreadyRunning.size())
                 + "/" + WorkerClusterConfig.WORKER_COUNT + " workers running"
                 + (alreadyRunning.isEmpty() ? "" : " (already running: " + alreadyRunning + ")"));
+        return started;
     }
 
     /** Polls each worker's own RMI registry until the worker is reachable. */
@@ -137,31 +160,105 @@ public final class WorkerClusterLauncher {
     }
 
     public static void stop() {
-        int stopped = 0;
+        List<Integer> all = new ArrayList<>();
         for (int workerId : WorkerClusterConfig.workerIds()) {
+            all.add(workerId);
+        }
+        stop(all);
+    }
+
+    /** Stops the given workers, taking care of orphaned (untracked) copies as well. */
+    public static void stop(List<Integer> workerIds) {
+        int stopped = 0;
+        for (Integer workerId : workerIds) {
             Path pidFile = Paths.get(WorkerClusterConfig.LOG_DIR, pidFileName(workerId));
-            Integer pid = readPid(pidFile);
-            if (pid == null || !isAlive(pid)) {
-                System.out.println("Worker " + workerId + " is not running");
-                deleteQuietly(pidFile);
-                continue;
+            Integer trackedPid = readPid(pidFile);
+            int stoppedHere = 0;
+            Set<Long> killed = new HashSet<>();
+
+            if (trackedPid != null && isAlive(trackedPid)) {
+                killed.add(trackedPid.longValue());
+                if (stopPid(trackedPid.longValue())) {
+                    stoppedHere++;
+                }
             }
-            ProcessHandle.of(pid).ifPresent(handle -> {
-                handle.destroy();
-                try {
-                    Thread.sleep(500);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+            for (long runningPid : findRunningPids(workerId, WorkerClusterConfig.portFor(workerId))) {
+                if (killed.add(runningPid) && stopPid(runningPid)) {
+                    stoppedHere++;
                 }
-                if (handle.isAlive()) {
-                    handle.destroyForcibly();
-                }
-            });
-            System.out.println("Stopped Worker " + workerId + " (pid " + pid + ")");
+            }
+
             deleteQuietly(pidFile);
-            stopped++;
+            if (stoppedHere > 0) {
+                System.out.println("Stopped Worker " + workerId + " (" + stoppedHere
+                        + " process" + (stoppedHere == 1 ? "" : "es") + ")");
+            } else {
+                System.out.println("Worker " + workerId + " is not running");
+            }
+            stopped += stoppedHere;
         }
         System.out.println("Stopped " + stopped + " worker process(es)");
+    }
+
+    private static boolean stopPid(long pid) {
+        return ProcessHandle.of(pid).map(handle -> {
+            handle.destroy();
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (handle.isAlive()) {
+                handle.destroyForcibly();
+            }
+            return true;
+        }).orElse(false);
+    }
+
+    /**
+     * True when this worker's pid file exists and the recorded process is still
+     * alive - i.e. the worker was launched (and is being tracked) by this
+     * Server Manager / launcher.
+     */
+    public static boolean isManagedAndAlive(int workerId) {
+        Path pidFile = Paths.get(WorkerClusterConfig.LOG_DIR, pidFileName(workerId));
+        Integer pid = readPid(pidFile);
+        return pid != null && isAlive(pid);
+    }
+
+    /** Lightweight check that a worker currently answers its RMI registry with its own id. */
+    private static boolean isReachableOverRmi(int workerId, String host) {
+        try {
+            Registry registry = LocateRegistry.getRegistry(host, WorkerClusterConfig.portFor(workerId));
+            WorkerService worker = (WorkerService) registry.lookup(WorkerClusterConfig.serviceNameFor(workerId));
+            return worker.getWorkerId() == workerId;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Finds every live JVM running our WorkerServer command line for <i>workerId</i>
+     * on <i>port</i>, regardless of whether a pid file tracks it. This is what lets
+     * Start avoid duplicates and Stop reclaim orphaned workers that a previous
+     * Server Manager session left behind.
+     */
+    private static List<Long> findRunningPids(int workerId, int port) {
+        Pattern pattern = Pattern.compile(
+                "com\\.cs324\\.backend\\.worker\\.WorkerServer\\s+" + workerId + "\\s+" + port + "(?:\\s|$)");
+        List<Long> pids = new ArrayList<>();
+        try {
+            ProcessHandle.allProcesses().forEach(handle -> {
+                String commandLine = handle.info().commandLine().orElse("");
+                if (commandLine.contains(WorkerServer.class.getName())
+                        && pattern.matcher(commandLine).find()) {
+                    pids.add(handle.pid());
+                }
+            });
+        } catch (Exception e) {
+            System.err.println("Could not enumerate running worker processes: " + e.getMessage());
+        }
+        return pids;
     }
 
     private static void status() {

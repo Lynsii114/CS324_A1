@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -86,6 +87,14 @@ public class ServerGUI extends JFrame {
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
     private int previousCoordinator = WorkerService.NO_COORDINATOR;
 
+    /**
+     * Workers launched by this Server Manager session. When the GUI closes, only
+     * these are stopped - so closing the manager never leaves orphaned worker
+     * processes behind (the cause of "workers show online on a fresh start"),
+     * and workers started manually from a terminal are left untouched.
+     */
+    private final Set<Integer> sessionLaunchedWorkers = ConcurrentHashMap.newKeySet();
+
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new ServerGUI().setVisible(true));
     }
@@ -112,6 +121,27 @@ public class ServerGUI extends JFrame {
         log("Server manager ready. Start the Bootstrap Node, then start the workers - "
                 + "they elect a coordinator automatically (lowest JAC wins, ties go to the "
                 + "highest worker ID), no manual trigger needed.");
+
+        // Closing the Server Manager must not leave the six worker JVMs running in the
+        // background: orphaned workers keep answering on their RMI ports, so the next
+        // launch of this GUI would show them "Online" although nobody started them this
+        // session. On exit we only stop the workers this session launched.
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (!sessionLaunchedWorkers.isEmpty()) {
+                System.out.println("[ServerGUI] closing - stopping workers launched this session: "
+                        + sessionLaunchedWorkers);
+                WorkerClusterLauncher.stop(new ArrayList<>(sessionLaunchedWorkers));
+            }
+        }, "server-gui-shutdown"));
+
+        executor.submit(() -> {
+            try {
+                Thread.sleep(1500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            checkForLeftoverWorkers();
+        });
 
         Timer timer = new Timer(2500, e -> refreshBackground());
         timer.start();
@@ -317,8 +347,9 @@ public class ServerGUI extends JFrame {
             boolean started = false;
             try {
                 log("Launching " + WorkerClusterConfig.WORKER_COUNT + " worker processes (this can take a few seconds)...");
-                WorkerClusterLauncher.start(bootstrapHost, bootstrapPort);
-                started = true;
+                List<Integer> launched = WorkerClusterLauncher.start(bootstrapHost, bootstrapPort);
+                sessionLaunchedWorkers.addAll(launched);
+                started = !launched.isEmpty();
             } catch (Exception e) {
                 log("Could not start workers: " + rootMessage(e));
             }
@@ -336,9 +367,43 @@ public class ServerGUI extends JFrame {
     private void stopWorkers() {
         executor.submit(() -> {
             WorkerClusterLauncher.stop();
+            sessionLaunchedWorkers.clear();
             log("Worker processes stopped - the dashboard will show OFFLINE");
             refreshBackground();
         });
+    }
+
+    /**
+     * Workers should show OFFLINE until this session starts them. If RMI probing
+     * still finds workers online, they were left behind by an earlier run (or
+     * started manually) and are not tracked by this manager - surface that once,
+     * so the dashboard does not look like a fresh offline cluster.
+     */
+    private void checkForLeftoverWorkers() {
+        if (!sessionLaunchedWorkers.isEmpty()) {
+            return;
+        }
+        int leftover = 0;
+        for (int workerId : WorkerClusterConfig.workerIds()) {
+            boolean reachable;
+            try {
+                lookupWorker(workerId);
+                reachable = true;
+            } catch (Exception e) {
+                reachable = false;
+            }
+            if (reachable && !WorkerClusterLauncher.isManagedAndAlive(workerId)) {
+                leftover++;
+            }
+        }
+        if (leftover > 0) {
+            log("WARNING: " + leftover + "/" + WorkerClusterConfig.WORKER_COUNT
+                    + " worker process(es) are already online but were not started from this session"
+                    + " (left over from an earlier run, or launched manually). They occupy ports "
+                    + WorkerClusterConfig.BASE_WORKER_PORT + ".."
+                    + WorkerClusterConfig.portFor(WorkerClusterConfig.LAST_WORKER_ID)
+                    + ". Click 'Stop Workers' to reclaim them, then 'Start Workers'.");
+        }
     }
 
     private void refreshStatus() {

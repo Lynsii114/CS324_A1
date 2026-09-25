@@ -50,7 +50,7 @@ hop-by-hop over the neighbour graph.
 
 ---
 
-## Election, Startup Lottery & Tie-Breaking Rules
+## Election, Startup & Tie-Breaking Rules
 
 The election protocol runs in three phases.
 
