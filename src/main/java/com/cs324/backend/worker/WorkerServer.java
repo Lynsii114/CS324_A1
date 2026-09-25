@@ -42,7 +42,10 @@ public class WorkerServer {
             bootstrap.registerWorker(self);
             int neighbourCount = worker.syncNeighbours();
 
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                worker.shutdownLocalJobExecutor();
+                unregisterQuietly(bootstrap, workerId);
+            }));
 
             System.out.println("Worker Node " + workerId + " started on port " + workerPort);
             System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);

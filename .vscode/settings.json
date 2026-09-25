@@ -1,0 +1,6 @@
+{
+    "java.configuration.updateBuildConfiguration": "interactive",
+    "terminal.integrated.env.windows": {
+        "CLASSPATH": "${workspaceFolder}\\target\\classes;${env:USERPROFILE}\\.m2\\repository\\com\\formdev\\flatlaf\\3.5.4\\flatlaf-3.5.4.jar"
+    }
+}

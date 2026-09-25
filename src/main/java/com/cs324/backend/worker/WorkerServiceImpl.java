@@ -23,9 +23,16 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -38,8 +45,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       discovered participants. Each worker keeps a thread-safe set of
  *       processed election ids so no message is handled twice and message loops
  *       are cut.</li>
- *   <li>The initiator broadcasts over its neighbour ring. Every reachable,
- *       active worker adds its own {@link CandidateInfo} snapshot and re-sends
+ *   <li>The initiator broadcasts over its random peer neighbours. Every
+ *       reachable, active worker adds its own {@link CandidateInfo} snapshot and re-sends
  *       the message to its neighbours (except the hop it came from), and echoes
  *       the merged participant set back. When all echoes return, every reachable
  *       worker has been discovered.</li>
@@ -54,6 +61,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerService {
     private static final long serialVersionUID = 1L;
+    private static final int MAX_COORDINATOR_JOBS_PER_TERM = 5;
+    private static final String DEFAULT_CLIENT_ID = "default";
 
     private final int workerId;
     private final String registeredHost;
@@ -61,10 +70,13 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private final BootstrapService bootstrapService;
 
     private final AtomicInteger jobAllocationCounter = new AtomicInteger(0);
-    private final AtomicInteger currentCoordinatorId = new AtomicInteger(NO_COORDINATOR);
+    private final Map<String, AtomicInteger> coordinatorJobsByClient = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> coordinatorByClient = new ConcurrentHashMap<>();
     private final Set<String> processedElectionIds = ConcurrentHashMap.newKeySet();
     private final Set<String> processedCoordinatorIds = ConcurrentHashMap.newKeySet();
     private final Set<WorkerInfo> neighbours = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger localJobThreadCounter = new AtomicInteger(1);
+    private final ExecutorService localJobExecutor;
     private final String leaderman = "cs324";
 
     public WorkerServiceImpl(int workerId, WorkerInfo self, BootstrapService bootstrapService)
@@ -74,6 +86,11 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         this.registeredHost = self.getHost();
         this.registeredPort = self.getPort();
         this.bootstrapService = bootstrapService;
+        this.localJobExecutor = Executors.newFixedThreadPool(4, runnable -> {
+            Thread thread = new Thread(runnable);
+            thread.setName("worker-" + workerId + "-job-" + localJobThreadCounter.getAndIncrement());
+            return thread;
+        });
     }
 
     @Override
@@ -133,13 +150,27 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     @Override
     public int getCurrentCoordinatorId() throws RemoteException {
-        return currentCoordinatorId.get();
+        return getCurrentCoordinatorId(DEFAULT_CLIENT_ID);
+    }
+
+    @Override
+    public int getCurrentCoordinatorId(String clientId) throws RemoteException {
+        return coordinatorFor(clientId).get();
     }
 
     @Override
     public void setCurrentCoordinatorId(int coordinatorId) throws RemoteException {
-        currentCoordinatorId.set(coordinatorId);
-        System.out.println("[Worker " + workerId + "] coordinator set to " + coordinatorId);
+        setCurrentCoordinatorId(DEFAULT_CLIENT_ID, coordinatorId);
+    }
+
+    @Override
+    public void setCurrentCoordinatorId(String clientId, int coordinatorId) throws RemoteException {
+        String key = clientKey(clientId);
+        coordinatorFor(key).set(coordinatorId);
+        if (coordinatorId == NO_COORDINATOR || coordinatorId == workerId) {
+            jobsFor(key).set(0);
+        }
+        System.out.println("[Worker " + workerId + "] coordinator for " + key + " set to " + coordinatorId);
     }
 
     @Override
@@ -154,22 +185,28 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     @Override
     public String initiateElection() throws RemoteException {
-        int existing = currentCoordinatorId.get();
+        return initiateElection(DEFAULT_CLIENT_ID);
+    }
+
+    @Override
+    public String initiateElection(String clientId) throws RemoteException {
+        String key = clientKey(clientId);
+        int existing = coordinatorFor(key).get();
         if (existing != NO_COORDINATOR) {
-            return "Coordinator already present: worker " + existing
+            return key + " coordinator already present: worker " + existing
                     + " - no election started (reset coordinators to " + NO_COORDINATOR + " first)";
         }
 
         refreshNeighbours();
 
         CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
-        String electionId = UUID.randomUUID().toString();
+        String electionId = key + "-" + UUID.randomUUID();
         // The initiator marks its own election as processed so a message that
         // loops back to it is dropped instead of being handled twice.
         processedElectionIds.add(electionId);
 
-        System.out.println("[Worker " + workerId + "] election " + electionId + " started, JAC=" + self.getJac()
-                + ", neighbours=" + neighbours.size());
+        System.out.println("[Worker " + workerId + "] election " + electionId + " started for " + key
+                + ", JAC=" + self.getJac() + ", neighbours=" + neighbours.size());
 
         ElectionMessage message = new ElectionMessage(electionId, self, self, new LinkedHashSet<>());
         ProcessedParticipants collected = propagateToNeighbours(message);
@@ -182,10 +219,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
                 + allParticipants.size() + " reachable workers");
 
-        WinnerAnnouncement announcement = new WinnerAnnouncement(electionId, winner, allParticipants);
+        WinnerAnnouncement announcement = new WinnerAnnouncement(electionId, key, winner, allParticipants);
         announceWinner(announcement);
 
-        return "Coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
+        return key + " coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
                 + ") across " + allParticipants.size() + " reachable workers [electionId=" + electionId + "]";
     }
 
@@ -205,6 +242,9 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         CandidateInfo self = new CandidateInfo(workerId, jobAllocationCounter.get(), registeredHost, registeredPort);
         Set<CandidateInfo> participants = new LinkedHashSet<>(message.getParticipants());
         participants.add(self);
+        System.out.println("[Worker " + workerId + "] ELECTION received <- from worker "
+                + message.getSender().getWorkerId() + ", election=" + message.getElectionId()
+                + ", participants=" + participants);
 
         ElectionMessage forwarded = new ElectionMessage(message.getElectionId(), message.getOriginator(), self, participants);
         return propagateToNeighbours(forwarded);
@@ -221,8 +261,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             return;
         }
 
-        currentCoordinatorId.set(announcement.getWinner().getWorkerId());
-        System.out.println("[Worker " + workerId + "] COORDINATOR received -> worker "
+        String key = clientKey(announcement.getClientId());
+        coordinatorFor(key).set(announcement.getWinner().getWorkerId());
+        jobsFor(key).set(0);
+        System.out.println("[Worker " + workerId + "] COORDINATOR received for " + key + " -> worker "
                 + announcement.getWinner().getWorkerId() + " (JAC=" + announcement.getWinner().getJac()
                 + ") for election " + announcement.getElectionId());
 
@@ -232,12 +274,18 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
 
     @Override
     public int submitMaxJob(List<Integer> numbers) throws RemoteException {
+        return submitMaxJob(DEFAULT_CLIENT_ID, numbers);
+    }
+
+    @Override
+    public int submitMaxJob(String clientId, List<Integer> numbers) throws RemoteException {
+        String key = clientKey(clientId);
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
-        if (currentCoordinatorId.get() != workerId) {
+        if (coordinatorFor(key).get() != workerId) {
             throw new RemoteException("Worker " + workerId
-                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+                    + " is not the coordinator for " + key + ". Current coordinator is " + coordinatorFor(key).get());
         }
 
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
@@ -246,37 +294,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new RemoteException("No reachable workers are available for MAX job");
         }
 
-        System.out.println("[Worker " + workerId + "] MAX job received -> numbers="
+        System.out.println("[Worker " + workerId + "] MAX job received for " + key + " -> numbers="
                 + numbers + ", reachableWorkers=" + reachableWorkers.size()
                 + ", assignedWorkers=" + workerCount);
 
+        List<ChunkResult<Integer>> results = runParallelChunkJob("MAX", numbers, reachableWorkers, workerCount,
+                WorkerService::computePartialMax);
         int finalMax = Integer.MIN_VALUE;
-        int start = 0;
-        for (int index = 0; index < workerCount; index++) {
-            int remainingNumbers = numbers.size() - start;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
-            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
-            WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
-
-            try {
-                System.out.println("[Worker " + workerId + "] MAX assigning -> toWorkerId="
-                        + assignedWorkerId + ", section=" + chunk);
-                int partialMax = worker.computePartialMax(chunk);
-                finalMax = Math.max(finalMax, partialMax);
-                System.out.println("[Worker " + workerId + "] MAX partial result <- fromWorkerId="
-                        + assignedWorkerId + ", partialMax=" + partialMax
-                        + ", currentFinalMax=" + finalMax);
-            } catch (Exception e) {
-                throw new RemoteException("MAX job failed while assigning worker "
-                        + assignedWorkerId, e);
-            }
-
-            start += chunkSize;
+        for (ChunkResult<Integer> result : results) {
+            finalMax = Math.max(finalMax, result.value());
+            System.out.println("[Worker " + workerId + "] MAX partial result <- fromWorkerId="
+                    + result.workerId() + ", partialMax=" + result.value()
+                    + ", currentFinalMax=" + finalMax);
         }
 
         System.out.println("[Worker " + workerId + "] MAX final result -> max=" + finalMax);
+        completeCoordinatorJob(key, "MAX");
         return finalMax;
     }
 
@@ -286,21 +319,29 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
 
-        int partialMax = Collections.max(numbers);
-        int updatedJac = jobAllocationCounter.incrementAndGet();
-        System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
-                + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
-        return partialMax;
+        return runLocalJob("MAX", numbers, () -> {
+            int partialMax = Collections.max(numbers);
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] MAX partial compute -> section="
+                    + numbers + ", partialMax=" + partialMax + ", JAC=" + updatedJac);
+            return partialMax;
+        });
     }
 
     @Override
     public long submitPrimeSumJob(List<Integer> numbers) throws RemoteException {
+        return submitPrimeSumJob(DEFAULT_CLIENT_ID, numbers);
+    }
+
+    @Override
+    public long submitPrimeSumJob(String clientId, List<Integer> numbers) throws RemoteException {
+        String key = clientKey(clientId);
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
-        if (currentCoordinatorId.get() != workerId) {
+        if (coordinatorFor(key).get() != workerId) {
             throw new RemoteException("Worker " + workerId
-                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+                    + " is not the coordinator for " + key + ". Current coordinator is " + coordinatorFor(key).get());
         }
 
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
@@ -309,37 +350,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new RemoteException("No reachable workers are available for PRIMESUM job");
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMESUM job received -> numbers="
+        System.out.println("[Worker " + workerId + "] PRIMESUM job received for " + key + " -> numbers="
                 + numbers + ", reachableWorkers=" + reachableWorkers.size()
                 + ", assignedWorkers=" + workerCount);
 
+        List<ChunkResult<Long>> results = runParallelChunkJob("PRIMESUM", numbers, reachableWorkers, workerCount,
+                WorkerService::computePartialPrimeSum);
         long finalSum = 0L;
-        int start = 0;
-        for (int index = 0; index < workerCount; index++) {
-            int remainingNumbers = numbers.size() - start;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
-            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
-            WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
-
-            try {
-                System.out.println("[Worker " + workerId + "] PRIMESUM assigning -> toWorkerId="
-                        + assignedWorkerId + ", section=" + chunk);
-                long partialSum = worker.computePartialPrimeSum(chunk);
-                finalSum += partialSum;
-                System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
-                        + assignedWorkerId + ", partialSum=" + partialSum
-                        + ", currentFinalSum=" + finalSum);
-            } catch (Exception e) {
-                throw new RemoteException("PRIMESUM job failed while assigning worker "
-                        + assignedWorkerId, e);
-            }
-
-            start += chunkSize;
+        for (ChunkResult<Long> result : results) {
+            finalSum += result.value();
+            System.out.println("[Worker " + workerId + "] PRIMESUM partial result <- fromWorkerId="
+                    + result.workerId() + ", partialSum=" + result.value()
+                    + ", currentFinalSum=" + finalSum);
         }
 
         System.out.println("[Worker " + workerId + "] PRIMESUM final result -> sum=" + finalSum);
+        completeCoordinatorJob(key, "PRIMESUM");
         return finalSum;
     }
 
@@ -349,26 +375,34 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
 
-        long partialSum = 0L;
-        for (Integer number : numbers) {
-            if (number != null && isPrime(number)) {
-                partialSum += number;
+        return runLocalJob("PRIMESUM", numbers, () -> {
+            long partialSum = 0L;
+            for (Integer number : numbers) {
+                if (number != null && isPrime(number)) {
+                    partialSum += number;
+                }
             }
-        }
-        int updatedJac = jobAllocationCounter.incrementAndGet();
-        System.out.println("[Worker " + workerId + "] PRIMESUM partial compute -> section="
-                + numbers + ", partialSum=" + partialSum + ", JAC=" + updatedJac);
-        return partialSum;
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] PRIMESUM partial compute -> section="
+                    + numbers + ", partialSum=" + partialSum + ", JAC=" + updatedJac);
+            return partialSum;
+        });
     }
 
     @Override
     public int submitPrimeCountJob(List<Integer> numbers) throws RemoteException {
+        return submitPrimeCountJob(DEFAULT_CLIENT_ID, numbers);
+    }
+
+    @Override
+    public int submitPrimeCountJob(String clientId, List<Integer> numbers) throws RemoteException {
+        String key = clientKey(clientId);
         if (numbers == null || numbers.isEmpty()) {
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
-        if (currentCoordinatorId.get() != workerId) {
+        if (coordinatorFor(key).get() != workerId) {
             throw new RemoteException("Worker " + workerId
-                    + " is not the coordinator. Current coordinator is " + currentCoordinatorId.get());
+                    + " is not the coordinator for " + key + ". Current coordinator is " + coordinatorFor(key).get());
         }
 
         List<WorkerService> reachableWorkers = getReachableWorkerServices();
@@ -377,37 +411,22 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new RemoteException("No reachable workers are available for PRIMECOUNT job");
         }
 
-        System.out.println("[Worker " + workerId + "] PRIMECOUNT job received -> numbers="
+        System.out.println("[Worker " + workerId + "] PRIMECOUNT job received for " + key + " -> numbers="
                 + numbers + ", reachableWorkers=" + reachableWorkers.size()
                 + ", assignedWorkers=" + workerCount);
 
+        List<ChunkResult<Integer>> results = runParallelChunkJob("PRIMECOUNT", numbers, reachableWorkers, workerCount,
+                WorkerService::computePartialPrimeCount);
         int finalCount = 0;
-        int start = 0;
-        for (int index = 0; index < workerCount; index++) {
-            int remainingNumbers = numbers.size() - start;
-            int remainingWorkers = workerCount - index;
-            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
-            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
-            WorkerService worker = reachableWorkers.get(index);
-            int assignedWorkerId = worker.getWorkerId();
-
-            try {
-                System.out.println("[Worker " + workerId + "] PRIMECOUNT assigning -> toWorkerId="
-                        + assignedWorkerId + ", section=" + chunk);
-                int partialCount = worker.computePartialPrimeCount(chunk);
-                finalCount += partialCount;
-                System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
-                        + assignedWorkerId + ", partialCount=" + partialCount
-                        + ", currentFinalCount=" + finalCount);
-            } catch (Exception e) {
-                throw new RemoteException("PRIMECOUNT job failed while assigning worker "
-                        + assignedWorkerId, e);
-            }
-
-            start += chunkSize;
+        for (ChunkResult<Integer> result : results) {
+            finalCount += result.value();
+            System.out.println("[Worker " + workerId + "] PRIMECOUNT partial result <- fromWorkerId="
+                    + result.workerId() + ", partialCount=" + result.value()
+                    + ", currentFinalCount=" + finalCount);
         }
 
         System.out.println("[Worker " + workerId + "] PRIMECOUNT final result -> count=" + finalCount);
+        completeCoordinatorJob(key, "PRIMECOUNT");
         return finalCount;
     }
 
@@ -417,16 +436,59 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
             throw new IllegalArgumentException("numbers must not be null or empty");
         }
 
-        int partialCount = 0;
-        for (Integer number : numbers) {
-            if (number != null && isPrime(number)) {
-                partialCount++;
+        return runLocalJob("PRIMECOUNT", numbers, () -> {
+            int partialCount = 0;
+            for (Integer number : numbers) {
+                if (number != null && isPrime(number)) {
+                    partialCount++;
+                }
             }
+            int updatedJac = jobAllocationCounter.incrementAndGet();
+            System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
+                    + numbers + ", partialCount=" + partialCount + ", JAC=" + updatedJac);
+            return partialCount;
+        });
+    }
+
+    private <T> T runLocalJob(String jobName, List<Integer> numbers, Callable<T> task) throws RemoteException {
+        Future<T> future = localJobExecutor.submit(() -> {
+            String threadName = Thread.currentThread().getName();
+            System.out.println("[Worker " + workerId + "] Starting " + jobName
+                    + " on thread: " + threadName + ", section=" + numbers);
+            try {
+                T result = task.call();
+                System.out.println("[Worker " + workerId + "] Completed " + jobName
+                        + " on thread: " + threadName);
+                return result;
+            } catch (Exception e) {
+                System.err.println("[Worker " + workerId + "] Failed " + jobName
+                        + " on thread: " + threadName + " - " + e.getMessage());
+                throw e;
+            }
+        });
+
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new RemoteException(jobName + " local worker thread was interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            throw new RemoteException(jobName + " local worker thread failed: " + cause.getMessage(), cause);
         }
-        int updatedJac = jobAllocationCounter.incrementAndGet();
-        System.out.println("[Worker " + workerId + "] PRIMECOUNT partial compute -> section="
-                + numbers + ", partialCount=" + partialCount + ", JAC=" + updatedJac);
-        return partialCount;
+    }
+
+    public void shutdownLocalJobExecutor() {
+        localJobExecutor.shutdown();
+        try {
+            if (!localJobExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
+                localJobExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            localJobExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     private boolean isPrime(int value) {
@@ -447,6 +509,106 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         return true;
     }
 
+    private synchronized void completeCoordinatorJob(String clientId, String jobName) throws RemoteException {
+        String key = clientKey(clientId);
+        AtomicInteger coordinatorJobsThisTerm = jobsFor(key);
+        int completed = coordinatorJobsThisTerm.incrementAndGet();
+        int updatedJac = jobAllocationCounter.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] TERM job completed for " + key + " -> jobType=" + jobName
+                + ", jobsThisTerm=" + completed + "/" + MAX_COORDINATOR_JOBS_PER_TERM
+                + ", coordinatorJAC=" + updatedJac);
+
+        if (completed < MAX_COORDINATOR_JOBS_PER_TERM) {
+            return;
+        }
+
+        System.out.println("[Worker " + workerId + "] TERM for " + key + " ended after "
+                + MAX_COORDINATOR_JOBS_PER_TERM + " assigned jobs; starting automatic election");
+        coordinatorJobsThisTerm.set(0);
+
+        List<WorkerService> reachableWorkers = getReachableWorkerServices();
+        for (WorkerService worker : reachableWorkers) {
+            try {
+                worker.setCurrentCoordinatorId(key, NO_COORDINATOR);
+            } catch (RemoteException e) {
+                System.err.println("[Worker " + workerId + "] TERM reset failed for a worker: "
+                        + e.getMessage());
+            }
+        }
+
+        String result = initiateElection(key);
+        System.out.println("[Worker " + workerId + "] TERM automatic election result -> " + result);
+    }
+
+    private String clientKey(String clientId) {
+        return clientId == null || clientId.isBlank() ? DEFAULT_CLIENT_ID : clientId.trim();
+    }
+
+    private AtomicInteger coordinatorFor(String clientId) {
+        return coordinatorByClient.computeIfAbsent(clientKey(clientId), ignored -> new AtomicInteger(NO_COORDINATOR));
+    }
+
+    private AtomicInteger jobsFor(String clientId) {
+        return coordinatorJobsByClient.computeIfAbsent(clientKey(clientId), ignored -> new AtomicInteger(0));
+    }
+
+    private <T> List<ChunkResult<T>> runParallelChunkJob(String jobName, List<Integer> numbers,
+            List<WorkerService> reachableWorkers, int workerCount, ChunkTask<T> task) throws RemoteException {
+        List<ChunkAssignment> assignments = createChunkAssignments(numbers, reachableWorkers, workerCount);
+        AtomicInteger threadCounter = new AtomicInteger(1);
+        ExecutorService executor = Executors.newFixedThreadPool(assignments.size(), runnable -> {
+            Thread thread = new Thread(runnable);
+            thread.setName("worker-" + workerId + "-" + jobName.toLowerCase()
+                    + "-dispatch-" + threadCounter.getAndIncrement());
+            return thread;
+        });
+
+        try {
+            List<Future<ChunkResult<T>>> futures = new ArrayList<>();
+            for (ChunkAssignment assignment : assignments) {
+                Callable<ChunkResult<T>> callable = () -> {
+                    System.out.println("[Worker " + workerId + "] " + jobName
+                            + " assigning on " + Thread.currentThread().getName()
+                            + " -> toWorkerId=" + assignment.workerId()
+                            + ", section=" + assignment.chunk());
+                    T value = task.compute(assignment.worker(), assignment.chunk());
+                    return new ChunkResult<>(assignment.workerId(), assignment.chunk(), value);
+                };
+                futures.add(executor.submit(callable));
+            }
+
+            List<ChunkResult<T>> results = new ArrayList<>();
+            for (Future<ChunkResult<T>> future : futures) {
+                results.add(future.get());
+            }
+            return results;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RemoteException(jobName + " job interrupted while waiting for worker threads", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            throw new RemoteException(jobName + " job failed in a worker thread: " + cause.getMessage(), cause);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private List<ChunkAssignment> createChunkAssignments(List<Integer> numbers, List<WorkerService> workers,
+            int workerCount) throws RemoteException {
+        List<ChunkAssignment> assignments = new ArrayList<>();
+        int start = 0;
+        for (int index = 0; index < workerCount; index++) {
+            int remainingNumbers = numbers.size() - start;
+            int remainingWorkers = workerCount - index;
+            int chunkSize = (remainingNumbers + remainingWorkers - 1) / remainingWorkers;
+            List<Integer> chunk = new ArrayList<>(numbers.subList(start, start + chunkSize));
+            WorkerService worker = workers.get(index);
+            assignments.add(new ChunkAssignment(worker, worker.getWorkerId(), chunk));
+            start += chunkSize;
+        }
+        return assignments;
+    }
+
     /**
      * Forwards a message to every neighbour except the hop it came from,
      * merging the participant sets of all echo replies. This is what lets an
@@ -463,6 +625,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                 continue;
             }
             try {
+                System.out.println("[Worker " + workerId + "] ELECTION forwarding -> worker "
+                        + neighbour.getWorkerId() + ", election=" + message.getElectionId());
                 ProcessedParticipants reply = remote.receiveElection(message);
                 if (reply != null && reply.getParticipants() != null) {
                     participants.addAll(reply.getParticipants());
@@ -503,49 +667,59 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     /**
-     * Rebuilds the neighbour ring from the Bootstrap Node's active-worker
-     * registry. Each worker links to its immediate predecessor and successor in
-     * the sorted registry, so the ring grows dynamically as workers register.
+     * Rebuilds a random connected neighbour set from the Bootstrap Node's
+     * active-worker registry. Workers are placed into a shuffled ring and each
+     * worker links to the adjacent peers in that random ring, so elections can
+     * still reach the full active cluster.
      */
     private synchronized int refreshNeighbours() {
         try {
-            List<WorkerInfo> sortedAll = new ArrayList<>();
-            boolean foundSelf = false;
+            List<WorkerInfo> randomRing = new ArrayList<>();
             for (WorkerInfo info : bootstrapService.getActiveWorkers()) {
-                if (info.getWorkerId() == workerId) {
-                    foundSelf = true;
-                }
-                sortedAll.add(info);
+                randomRing.add(info);
             }
+            boolean foundSelf = randomRing.stream().anyMatch(info -> info.getWorkerId() == workerId);
             if (!foundSelf) {
-                sortedAll.add(new WorkerInfo(workerId, registeredHost, registeredPort));
+                randomRing.add(new WorkerInfo(workerId, registeredHost, registeredPort));
             }
-            sortedAll.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
+            randomRing.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
+            Collections.shuffle(randomRing, new Random(randomTopologySeed(randomRing)));
 
-            int n = sortedAll.size();
-            if (n == 1) {
-                neighbours.clear();
-                return 0;
-            }
-            int idx = 0;
-            for (int i = 0; i < n; i++) {
-                if (sortedAll.get(i).getWorkerId() == workerId) {
-                    idx = i;
-                    break;
+            neighbours.clear();
+
+            if (randomRing.size() > 1) {
+                int index = indexOfSelf(randomRing);
+                WorkerInfo previous = randomRing.get((index - 1 + randomRing.size()) % randomRing.size());
+                WorkerInfo next = randomRing.get((index + 1) % randomRing.size());
+                neighbours.add(previous);
+                if (next.getWorkerId() != previous.getWorkerId()) {
+                    neighbours.add(next);
                 }
             }
-            WorkerInfo predecessor = sortedAll.get((idx - 1 + n) % n);
-            WorkerInfo successor = sortedAll.get((idx + 1) % n);
-            neighbours.clear();
-            neighbours.add(predecessor);
-            if (successor.getWorkerId() != predecessor.getWorkerId()) {
-                neighbours.add(successor);
-            }
+
+            System.out.println("[Worker " + workerId + "] RANDOM neighbours -> " + neighbours);
             return neighbours.size();
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] neighbour sync failed: " + e.getMessage());
             return neighbours.size();
         }
+    }
+
+    private long randomTopologySeed(List<WorkerInfo> activeWorkers) {
+        long seed = WorkerClusterConfig.RANDOM_TOPOLOGY_SEED;
+        for (WorkerInfo info : activeWorkers) {
+            seed = 31 * seed + info.getWorkerId();
+        }
+        return seed;
+    }
+
+    private int indexOfSelf(List<WorkerInfo> workers) {
+        for (int i = 0; i < workers.size(); i++) {
+            if (workers.get(i).getWorkerId() == workerId) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     private List<WorkerService> getReachableWorkerServices() throws RemoteException {
@@ -619,13 +793,24 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         }
     }
 
+    @FunctionalInterface
+    private interface ChunkTask<T> {
+        T compute(WorkerService worker, List<Integer> chunk) throws Exception;
+    }
+
+    private record ChunkAssignment(WorkerService worker, int workerId, List<Integer> chunk) {
+    }
+
+    private record ChunkResult<T>(int workerId, List<Integer> chunk, T value) {
+    }
+
     @Override
     public String toString() {
         return "WorkerServiceImpl{"
                 + "workerId=" + workerId
                 + ", jobAllocationCounter=" + jobAllocationCounter.get()
                 + ", neighbours=" + neighbours
-                + ", currentCoordinatorId=" + currentCoordinatorId.get()
+                + ", coordinators=" + coordinatorByClient
                 + ", leaderman='" + leaderman + '\''
                 + '}';
     }

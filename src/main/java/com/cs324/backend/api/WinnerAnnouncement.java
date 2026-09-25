@@ -12,17 +12,27 @@ public final class WinnerAnnouncement implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private final String electionId;
+    private final String clientId;
     private final CandidateInfo winner;
     private final Set<CandidateInfo> participants;
 
     public WinnerAnnouncement(String electionId, CandidateInfo winner, Set<CandidateInfo> participants) {
+        this(electionId, "default", winner, participants);
+    }
+
+    public WinnerAnnouncement(String electionId, String clientId, CandidateInfo winner, Set<CandidateInfo> participants) {
         this.electionId = electionId;
+        this.clientId = clientId == null || clientId.isBlank() ? "default" : clientId;
         this.winner = winner;
         this.participants = new LinkedHashSet<>(participants);
     }
 
     public String getElectionId() {
         return electionId;
+    }
+
+    public String getClientId() {
+        return clientId;
     }
 
     public CandidateInfo getWinner() {
@@ -35,7 +45,8 @@ public final class WinnerAnnouncement implements Serializable {
 
     @Override
     public String toString() {
-        return "WinnerAnnouncement{electionId='" + electionId + "', winner=" + winner
+        return "WinnerAnnouncement{electionId='" + electionId + "', clientId='" + clientId
+                + "', winner=" + winner
                 + ", participants=" + participants.size() + "}";
     }
 }

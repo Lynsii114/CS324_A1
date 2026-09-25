@@ -15,7 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Launches the six configured Worker Nodes (IDs 1-6) as six independent JVM
+ * Launches the configured Worker Nodes as independent JVM
  * processes. Each process gets its own RMI registry port, its own log file and
  * its own pid file, so the workers stay fully isolated while still talking to
  * each other (and to the Bootstrap Node) through Java RMI.

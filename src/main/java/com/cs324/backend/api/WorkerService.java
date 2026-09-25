@@ -34,13 +34,17 @@ public interface WorkerService extends Remote {
     /** Current coordinator id, or {@link #NO_COORDINATOR} if none is present. */
     int getCurrentCoordinatorId() throws RemoteException;
 
+    int getCurrentCoordinatorId(String clientId) throws RemoteException;
+
     void setCurrentCoordinatorId(int coordinatorId) throws RemoteException;
+
+    void setCurrentCoordinatorId(String clientId, int coordinatorId) throws RemoteException;
 
     String getLeaderman() throws RemoteException;
 
     /**
-     * Rebuilds the neighbour ring from the Bootstrap Node's registry of active
-     * workers. Returns the new number of neighbours.
+     * Rebuilds the random connected neighbour set from the Bootstrap Node's
+     * registry of active workers. Returns the new number of neighbours.
      */
     int syncNeighbours() throws RemoteException;
 
@@ -49,6 +53,8 @@ public interface WorkerService extends Remote {
      * present; otherwise returns the current coordinator.
      */
     String initiateElection() throws RemoteException;
+
+    String initiateElection(String clientId) throws RemoteException;
 
     /**
      * Handles an incoming ELECTION message. Returns {@code null} if the election
@@ -61,13 +67,19 @@ public interface WorkerService extends Remote {
 
     int submitMaxJob(List<Integer> numbers) throws RemoteException;
 
+    int submitMaxJob(String clientId, List<Integer> numbers) throws RemoteException;
+
     int computePartialMax(List<Integer> numbers) throws RemoteException;
 
     long submitPrimeSumJob(List<Integer> numbers) throws RemoteException;
 
+    long submitPrimeSumJob(String clientId, List<Integer> numbers) throws RemoteException;
+
     long computePartialPrimeSum(List<Integer> numbers) throws RemoteException;
 
     int submitPrimeCountJob(List<Integer> numbers) throws RemoteException;
+
+    int submitPrimeCountJob(String clientId, List<Integer> numbers) throws RemoteException;
 
     int computePartialPrimeCount(List<Integer> numbers) throws RemoteException;
 }
