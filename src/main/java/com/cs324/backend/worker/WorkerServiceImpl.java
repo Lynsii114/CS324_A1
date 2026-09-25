@@ -665,14 +665,26 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
         System.out.println("[Worker " + workerId + "] completed "
                 + WorkerService.COORDINATOR_TERM_LIMIT + " jobs this term - ending term "
                 + "and starting a new leader election");
-        broadcastTermEnd();
+        Map<Integer, Integer> jacTable = broadcastTermEnd();
 
-        // Demotion tick: when every worker processed the same number of segments
-        // (e.g. a PRIMECOUNT that always fans out to all six nodes) the tied
-        // election would re-elect the outgoing coordinator forever. Marking the
-        // step-down as +1 JAC keeps the lowest-JAC rule intact while letting the
-        // next term rotate to a least-loaded worker.
-        jobAllocationCounter.incrementAndGet();
+        // Demotion tick: the coordinator never executes segments itself (every
+        // segment goes to the worker nodes), so its own JAC stays flat while the
+        // worker nodes climb. Without a penalty the lowest-JAC election would
+        // re-elect the same node every term. Lifting the outgoing coordinator's
+        // JAC strictly above the highest worker-node JAC seen at Term_End forces
+        // the next election to rotate to a genuinely least-loaded node.
+        int highestNodeJac = Integer.MIN_VALUE;
+        for (Map.Entry<Integer, Integer> entry : jacTable.entrySet()) {
+            if (entry.getKey() != workerId) {
+                highestNodeJac = Math.max(highestNodeJac, entry.getValue());
+            }
+        }
+        if (highestNodeJac != Integer.MIN_VALUE) {
+            int demotionTarget = highestNodeJac + 1;
+            if (jobAllocationCounter.get() <= highestNodeJac) {
+                jobAllocationCounter.addAndGet(demotionTarget - jobAllocationCounter.get());
+            }
+        }
         System.out.println("[Worker " + workerId + "] demotion tick -> JAC is now "
                 + jobAllocationCounter.get());
 
@@ -688,9 +700,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
      * Phase-3 step-down protocol: before dropping to a worker role, the
      * coordinator pauses incoming traffic (the term counter is at its limit, so
      * further submissions are refused) and broadcasts a Term_End message with
-     * the final verified JAC table to every reachable worker.
+     * the final verified JAC table to every reachable worker. Returns that JAC
+     * table so the caller can compute its own step-down penalty.
      */
-    private void broadcastTermEnd() {
+    private Map<Integer, Integer> broadcastTermEnd() {
         try {
             List<WorkerService> reachable = getReachableWorkerServices();
             Map<Integer, Integer> jacTable = new HashMap<>();
@@ -710,8 +723,10 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
                             + targetId + ": " + e.getMessage());
                 }
             }
+            return jacTable;
         } catch (RemoteException e) {
             System.err.println("[Worker " + workerId + "] Term_End broadcast failed: " + e.getMessage());
+            return Collections.emptyMap();
         }
     }
 
@@ -1169,26 +1184,26 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     }
 
     /**
-     * The workers a coordinator may hand segments of a client task to: the
-     * reachable set from {@link #getReachableWorkerServices()} with the
-     * coordinator itself moved to the end of the ranking. The least-loaded
-     * worker nodes are preferred first, so each client's task spreads over a
-     * different subset of workers as the JACs diverge, and the coordinator only
-     * processes a segment itself when a task is big enough to need every
-     * reachable worker (segment count == active workers).
+     * The workers a coordinator may hand segments of a client task to: every
+     * reachable active worker EXCEPT the coordinator itself, ranked by
+     * {@link #getReachableWorkerServices()} (least-loaded JAC first, then startup
+     * priority, then worker id). The coordinator only assigns and compiles - it
+     * never executes a segment itself, so a task is always shared between the
+     * worker nodes, and with six workers each task fans out over at most the
+     * other five nodes.
      */
     private List<WorkerService> getAssignmentWorkers() throws RemoteException {
         List<WorkerService> reachable = getReachableWorkerServices();
         List<WorkerService> others = new ArrayList<>();
-        List<WorkerService> self = new ArrayList<>();
         for (WorkerService worker : reachable) {
-            if (readWorkerId(worker) == workerId) {
-                self.add(worker);
-            } else {
+            if (readWorkerId(worker) != workerId) {
                 others.add(worker);
             }
         }
-        others.addAll(self);
+        if (others.isEmpty()) {
+            throw new RemoteException("No worker nodes reachable for task distribution - "
+                    + "the coordinator worker " + workerId + " is the only reachable node");
+        }
         return others;
     }
 

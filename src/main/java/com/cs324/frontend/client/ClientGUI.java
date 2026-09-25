@@ -146,6 +146,7 @@ public class ClientGUI extends JFrame {
         UITheme.textArea(logArea);
         UITheme.combo(jobTypeCombo);
         UITheme.table(taskTable);
+        taskTable.setModel(tableModel);
         taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         taskTable.setAutoCreateRowSorter(true);
         UITheme.label(connectionStatus, UITheme.MUTED);

@@ -20,25 +20,26 @@ import java.awt.Cursor;
 import java.awt.Font;
 
 /**
- * Shared dark-navy look-and-feel used by both the server and client GUIs.
- * Provides the colour palette, the larger fonts and the component styling so
- * the two GUIs stay visually consistent.
+ * Shared light look-and-feel used by both the server and client GUIs.
+ * Provides the colour palette, the fonts and the component styling so the two
+ * GUIs stay visually consistent.
  */
 public final class UITheme {
 
-    public static final Color BACKGROUND = new Color(0x0E, 0x16, 0x2A);
-    public static final Color PANEL = new Color(0x14, 0x24, 0x3B);
-    public static final Color CARD = new Color(0x1B, 0x30, 0x4E);
-    public static final Color INPUT = new Color(0x0A, 0x12, 0x20);
-    public static final Color ACCENT = new Color(0x52, 0xAA, 0xFF);
-    public static final Color BUTTON = new Color(0x2A, 0x52, 0x86);
-    public static final Color BUTTON_ACTIVE = new Color(0x1E, 0x3B, 0x5F);
-    public static final Color TEXT = new Color(0xEA, 0xF2, 0xFC);
-    public static final Color MUTED = new Color(0x9D, 0xAF, 0xC4);
-    public static final Color SUCCESS = new Color(0x3F, 0xD9, 0x8B);
-    public static final Color WARNING = new Color(0xFF, 0xC2, 0x3E);
-    public static final Color ERROR = new Color(0xFF, 0x5A, 0x5A);
-    public static final Color BORDER = new Color(0x33, 0x4D, 0x70);
+    public static final Color BACKGROUND = new Color(0xF1, 0xF3, 0xF7);
+    public static final Color PANEL = new Color(0xFF, 0xFF, 0xFF);
+    public static final Color CARD = new Color(0xE9, 0xED, 0xF4);
+    public static final Color INPUT = new Color(0xFF, 0xFF, 0xFF);
+    public static final Color ACCENT = new Color(0x2F, 0x6F, 0xED);
+    public static final Color BUTTON = new Color(0x2F, 0x6F, 0xED);
+    public static final Color BUTTON_ACTIVE = new Color(0x27, 0x59, 0xC4);
+    public static final Color TEXT = new Color(0x20, 0x29, 0x38);
+    public static final Color MUTED = new Color(0x5A, 0x64, 0x74);
+    public static final Color SUCCESS = new Color(0x1E, 0x9E, 0x5A);
+    public static final Color WARNING = new Color(0xC7, 0x7E, 0x00);
+    public static final Color ERROR = new Color(0xC6, 0x28, 0x39);
+    public static final Color BORDER = new Color(0xC4, 0xCC, 0xD8);
+    public static final Color LIGHT = new Color(0xFF, 0xFF, 0xFF);
 
     public static final Font BASE = new Font("SansSerif", Font.PLAIN, 15);
     public static final Font MEDIUM = new Font("SansSerif", Font.PLAIN, 17);
@@ -72,7 +73,7 @@ public final class UITheme {
         UIManager.put("ComboBox.background", INPUT);
         UIManager.put("ComboBox.foreground", TEXT);
         UIManager.put("ComboBox.selectionBackground", BUTTON);
-        UIManager.put("ComboBox.selectionForeground", TEXT);
+        UIManager.put("ComboBox.selectionForeground", LIGHT);
     }
 
     public static Border titledBorder(String title) {
@@ -97,7 +98,7 @@ public final class UITheme {
     public static void button(JButton button) {
         button.setFont(BOLD);
         button.setBackground(BUTTON);
-        button.setForeground(TEXT);
+        button.setForeground(LIGHT);
         button.setFocusPainted(false);
         button.setOpaque(true);
         button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -138,17 +139,17 @@ public final class UITheme {
                 setFont(MEDIUM);
                 setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
                 setBackground(isSelected ? BUTTON : INPUT);
-                setForeground(TEXT);
+                setForeground(isSelected ? LIGHT : TEXT);
                 return this;
             }
         });
     }
 
     public static void table(JTable table) {
-        table.setBackground(CARD);
+        table.setBackground(PANEL);
         table.setForeground(TEXT);
         table.setSelectionBackground(BUTTON);
-        table.setSelectionForeground(TEXT);
+        table.setSelectionForeground(LIGHT);
         table.setFont(BASE);
         table.setRowHeight((int) (BASE.getSize() * 2.0));
         table.setShowGrid(true);
@@ -156,7 +157,7 @@ public final class UITheme {
         table.setFillsViewportHeight(true);
         JTableHeader header = table.getTableHeader();
         header.setBackground(BUTTON);
-        header.setForeground(TEXT);
+        header.setForeground(LIGHT);
         header.setFont(SECTION);
         header.setReorderingAllowed(false);
     }

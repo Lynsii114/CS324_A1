@@ -165,8 +165,10 @@ public class ServerGUI extends JFrame {
         UITheme.textField(bootstrapPortField);
         UITheme.textArea(logArea);
         UITheme.table(statusTable);
+        statusTable.setModel(tableModel);
         statusTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         UITheme.table(taskTable);
+        taskTable.setModel(taskModel);
         taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
     }
 
