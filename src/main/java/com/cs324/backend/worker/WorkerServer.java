@@ -41,13 +41,16 @@ public class WorkerServer {
 
             bootstrap.registerWorker(self);
             worker.syncNeighbours();
+            worker.startAutoElectionChecks();
+            worker.startStartupLottery();
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
 
             System.out.println("Worker Node " + workerId + " started on port " + workerPort);
             System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);
             System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
-            System.out.println("Initial state: JAC=0, coordinatorId=" + worker.getCurrentCoordinatorId()
+            System.out.println("Initial state: JAC=0, priority=PENDING (startup lottery), coordinatorId="
+                    + worker.getCurrentCoordinatorId()
                     + " (none), leaderman=" + worker.getLeaderman()
                     + ", neighbours=" + worker.getNeighbours());
         } catch (Exception e) {

@@ -17,7 +17,7 @@ public final class WorkerClusterConfig {
     private WorkerClusterConfig() {
     }
 
-    /** Returns the configured worker IDs: 1, 2, 3, 4, 5, 6. */
+    /** Returns the configured worker IDs: 1, 2, ..., 6. */
     public static int[] workerIds() {
         int[] ids = new int[WORKER_COUNT];
         for (int i = 0; i < WORKER_COUNT; i++) {

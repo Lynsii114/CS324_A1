@@ -3,6 +3,7 @@ package com.cs324.backend.api;
 import java.rmi.Remote;
 import java.rmi.RemoteException;
 import java.util.List;
+import java.util.Map;
 
 /**
  * RMI-exposed contract for a Worker Node. Exposes worker state, neighbour
@@ -17,6 +18,9 @@ public interface WorkerService extends Remote {
     int COORDINATOR_TERM_LIMIT = 5;
 
     int getWorkerId() throws RemoteException;
+
+    /** Startup-lottery priority id (1..6), {@code 0} until the lottery minted it. */
+    int getPriorityId() throws RemoteException;
 
     int getJobAllocationCounter() throws RemoteException;
 
@@ -95,4 +99,11 @@ public interface WorkerService extends Remote {
 
     /** Computes the sum of the primes in the inclusive range assigned by the coordinator. */
     long sumPrimeRange(int start, int end) throws RemoteException;
+
+    /**
+     * Term-End notification from a stepping-down coordinator, carrying its final
+     * verified JAC table so every worker can log the workload snapshot that
+     * drives the lowest-JAC re-election.
+     */
+    void notifyTermEnd(int priorCoordinatorId, Map<Integer, Integer> finalJacTable) throws RemoteException;
 }

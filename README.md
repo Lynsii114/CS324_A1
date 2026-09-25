@@ -1,452 +1,209 @@
-# CS324_A1
+# CS324 A1 — Distributed Computing Cluster (Bootstrap / Workers / Election)
 
-## Bootstrap Node
+## Project Overview
 
-This project implements the Bootstrap Node, the Worker Nodes and a distributed
-leader election protocol for a six-worker cluster (worker IDs `1` through `6`),
-all communicating through Java RMI.
+This project is a distributed computing cluster built with **Java RMI**. These are **six independent worker processes** connected in an unstructured network, a neutral
+**Bootstrap Node** tracking membership, and a distributed **leader election** that lets the
+workers agree on a **Coordinator** for one term at a time. Clients submit jobs (MAX, PRIMECOUNT,
+PRIMESUM); the coordinator re-splits the work into a **variable number of contiguous segments**
+(based on the task size) and RANKS the workers by **JAC** (lowest first) so the least-loaded nodes
+get work first — each worker that processes a segment has its own JAC incremented — merges the
+partial results and returns the final answer.
 
-The Bootstrap Node is a standalone Java RMI process that tracks active workers
-and exposes these remote methods:
+Each worker runs in its own JVM with its own RMI registry port, its own log file and its own
+pid file. Workers only know their direct neighbours (a ring backbone built from the Bootstrap
+registry plus random connections so new workers are randomly linked to an active worker), but
+elections and job distribution reason over **all reachable active workers** by forwarding messages
+hop-by-hop over the neighbour graph.
+---
 
-- `registerWorker(WorkerInfo worker)`
-- `unregisterWorker(int workerId)`
-- `getActiveWorkers()`
-- `getRandomWorker()`
+## Assignment Requirements
 
-The Bootstrap Node is strictly neutral. It serves only as a central registry of
-active workers. It never participates in leader elections, never executes jobs
-and never assigns tasks; job execution and leadership are reserved for the
-worker nodes.
+### Non-Functional Requirements
 
-Each Worker Node runs as a separate Java RMI process with:
+- **Clear separation of components** — `api` (contracts), `bootstrap`, `worker`, `frontend.client`.
+- **Thread safety** — `AtomicInteger` for JAC / `jobsThisTerm` / coordinator id; concurrent key
+  sets for neighbours and processed election ids; terminal term hand-over via `compareAndSet`.
+- **Failure handling** — unreachable neighbours are skipped; RMI exceptions are wrapped and
+  surfaced to the client; worker shutdown unregisters from the Bootstrap Node.
+- **No hard-coded network addresses (where avoidable)** — host and ports are CLI/field
+  configurable; only the fixed worker layout (IDs/ports) is centralised in `WorkerClusterConfig`.
+- **Meaningful logging** — each worker logs in `logs/worker-<id>.log`; the GUIs log to a panel.
+- **Modular object-oriented design** — RMI interfaces + DTOs in `com.cs324.backend.api`.
+- **Correct exception handling** — input validation on client and worker; over-term submissions
+  are refused with a clear message.
 
-- a unique integer worker ID
-- Job Allocation Counter (JAC) starting at `0`
-- a neighbour ring (each worker links to its predecessor and successor in the
-  registry, so the ring grows dynamically as workers register)
-- current coordinator ID, initially `-1` (none)
-- `leaderman = "cs324"`
-- a thread-safe set of processed election IDs for deduplication
+### Component Responsibilities
 
-When a Worker Node starts, it registers itself with the Bootstrap Node and
-rebuilds its neighbour ring from the active-worker registry.
+- **Bootstrap Node** — only tracks active workers and sequences startup-lottery claims; it never
+  runs jobs and never participates in elections. Exposes `registerWorker`, `unregisterWorker`,
+  `getActiveWorkers`, `getRandomWorker`, `lotteryClaim`, `getPriorityTable`.
+- **Worker** — registers with the Bootstrap Node, maintains neighbours, participates in the
+  startup lottery and in elections, and runs distributed computations. Tracks a lifetime **JAC**
+  (segments processed) and a per-term submitted-job counter.
+- **Coordinator** — a worker elected for one term. Receives jobs from clients, finds reachable
+  active workers, splits each task into segments of a fixed maximum size, hands them to the
+  lowest-JAC workers (incrementing the receiving worker's JAC), combines partial results, assigns
+  at most **five jobs per term**, then broadcasts Term_End and steps down.
+- **Client** — a separate process with a GUI that accepts manual or CSV input and submits jobs
+  concurrently.
 
-### Leader Election
+---
 
-Any worker can initiate a leader election while no coordinator is present
-(coordinator ID `-1`). The algorithm fulfils the following requirements:
+## Election, Startup Lottery & Tie-Breaking Rules
 
-- **Message propagation** - An `ELECTION` message is forwarded hop-by-hop
-  through neighbouring workers over the ring. Each worker re-sends the message
-  to its neighbours (except the hop it arrived from) and echoes back the merged
-  set of discovered participants, so messages terminate cleanly.
-- **Deduplication** - Every election gets a unique UUID election id. Every
-  worker maintains a thread-safe set (`ConcurrentHashMap.newKeySet()`) of
-  processed election ids; a message whose election id was already handled is
-  dropped, so no message is ever processed twice and message loops are cut.
-- **Network scope** - The election discovers every currently reachable, active
-  worker before a winner is chosen. Because each participating worker refreshes
-  its ring from the Bootstrap registry, newly joined workers are discovered as
-  well. The winner is selected only after all echoes have returned.
-- **Role separation** - The Bootstrap Node only hands out the active-worker
-  registry. Elections, winner selection and coordination happen entirely
-  between worker nodes over RMI.
-- **Tie-breaking** - Among the reachable workers, the one with the lowest JAC
-  wins (JAC counts allocated jobs, so lower means more free capacity). If two
-  or more workers tie on the same lowest JAC, the worker with the highest
-  unique Worker ID is elected. With the default cluster (every JAC = `0`)
-  worker `6` therefore wins.
+The election protocol runs in three phases.
 
-After the winner is chosen, the initiator broadcasts a `WinnerAnnouncement` to
-every participant, so all workers agree on the same coordinator. Initiating an
-election while a coordinator is already present is refused; reset the
-coordinators first if you want to re-run (see the `reset` command below).
+### Phase 1 — Startup & Initial Leader Election (Timer Lottery)
 
-### Six-Worker Cluster (IDs 1-6)
+1. All six workers boot with `JAC = 0` and no coordinator.
+2. When the Bootstrap Node reports the cluster complete (6/6 registered), every worker starts a
+   **randomized countdown of 150–300 ms**.
+3. The first worker whose countdown expires claims **startup priority 6**, the second claims
+   **priority 5**, … the last claims **priority 1**. The Bootstrap Node sequences the claims, so
+   every cold start produces priority ids `1..6` in a random assignment.
+4. The worker holding **priority 6** declares itself the **Initial Coordinator** and alerts the
+   other five; all empty JACs mean there is no better signal, so the lottery winner leads.
 
-The cluster layout is fixed in `WorkerClusterConfig`:
+### Phase 2 — Dynamic Segmented Task Distribution
 
-| Worker ID | RMI registry port | RMI binding name           | Log file             | Pid file            |
-|-----------|-------------------|----------------------------|----------------------|---------------------|
-| 1         | 5001              | `WorkerService-1`          | `logs/worker-1.log`  | `logs/worker-1.pid` |
-| 2         | 5002              | `WorkerService-2`          | `logs/worker-2.log`  | `logs/worker-2.pid` |
-| 3         | 5003              | `WorkerService-3`          | `logs/worker-3.log`  | `logs/worker-3.pid` |
-| 4         | 5004              | `WorkerService-4`          | `logs/worker-4.log`  | `logs/worker-4.pid` |
-| 5         | 5005              | `WorkerService-5`          | `logs/worker-5.log`  | `logs/worker-5.pid` |
-| 6         | 5006              | `WorkerService-6`          | `logs/worker-6.log`  | `logs/worker-6.pid` |
+5. Reachable workers are ranked by **JAC (ascending)** — least-loaded first — then by
+   startup priority (descending), then worker id.
+6. Each submitted task is split into a **variable number of contiguous segments**:
+   `max(1, min(activeWorkers, ⌈items / maxItemsPerSegment⌉))`. A large PRIMESUM spreads over many
+   workers, a small one over one or two — segment counts differ from task to task.
+7. Each segment is handed to the lowest-JAC worker, and **that worker's own JAC is incremented**
+   (including for a segment the coordinator keeps itself). The coordinator can therefore process
+   several clients concurrently, and the JAC values diverge naturally with workload.
 
-Every worker is an independent JVM process with its own RMI registry port, its
-own log file and its own pid file, so the six workers are isolated from each
-other. They still communicate through Java RMI: each worker binds its
-`WorkerService` in its own registry and registers with the Bootstrap Node, and
-any worker (or client) can call any other worker through
-`rmi://<host>:<port>/WorkerService-<id>`.
+### Phase 3 — Term Expiration & Lowest-JAC Re-Election
 
-### Project Structure
+8. A coordinator serves **at most 5 submitted client jobs** per term (`jobsThisTerm`). Immediately
+   after the 5th job it pauses, broadcasts **Term_End** containing its verified final JAC table,
+   demotes itself to `NO_COORDINATOR`, and starts a fresh election.
+9. The new coordinator is the reachable worker with the **lowest JAC**; on a tie the **highest
+   startup priority id** wins (worker id as a final safety net). The new coordinator's term counter
+   resets to 0 and it serves its own 5 jobs (its *own* JAC is never reset — it keeps climbing with
+   the segments it processes). When a term ends the outgoing coordinator takes a small **demotion
+   tick** (`JAC + 1`) after broadcasting Term_End, so a cluster in which every worker processed the
+   same number of segments (e.g. a PRIMECOUNT that fans out to all six nodes every time) still
+   rotates to a least-loaded worker instead of re-electing the same node forever.
+10. A 6th submission during the hand-over is refused until the new coordinator is announced;
+    clients retry automatically against the newly elected coordinator.
+
+**Election mechanics (used from Phase 3 onward, and as a fallback whenever no coordinator is
+present):** any worker can initiate an election; the fixed background check runs quietly and
+starts one when the cluster has no coordinator. An `ElectionMessage` (unique `electionId`) floods
+the neighbour graph; each worker processes a given election id **at most once** (duplicates are
+dropped), and a per-worker `electionInProgress` guard stops a worker from starting its own election
+while it is participating in another one. Each participant contributes a `CandidateInfo` (worker id
++ priority id + JAC) snapshot; echoed participant sets are merged back at the initiator, so every
+reachable active worker is considered. The winner is broadcast to all participants and every worker
+records the same coordinator.
+
+---
+
+## Project Structure
 
 ```text
 .
 +-- pom.xml
 +-- src/main/java/com/cs324
     +-- backend
-    |   +-- api          (RMI contracts & shared DTOs)
-    |   +-- bootstrap    (Bootstrap Node)
-    |   +-- worker       (Worker Node, cluster config & launcher)
+    |   +-- api          (RMI contracts & DTOs: WorkerService, BootstrapService, messages)
+    |   +-- bootstrap    (Bootstrap Node: BootstrapServer, BootstrapServiceImpl)
+    |   +-- worker       (WorkerServer, WorkerServiceImpl, WorkerClusterConfig, launcher)
+    |   +-- gui          (ServerGUI - manages the cluster)
     +-- frontend
-        +-- client       (manual test harnesses)
+        +-- client       (ClientGUI - submits jobs)
+        +-- ui           (UITheme - shared dark look-and-feel)
 ```
 
-### Compile
+## Requirements
 
-From the repository root:
+- **JDK 17+** (compiled with `--release 17`; developed and tested on OpenJDK 17–26).
+- **Maven 3.8+**.
+- Any OS with Java + RMI; all examples assume a shell on `localhost`.
 
-```powershell
+## Compile
+
+```bash
 mvn clean compile
 ```
 
-Compiled classes land in `target/classes`. All run commands below launch the
-corresponding `main` with the JVM directly:
+Compiled classes land in `target/classes`. All launch commands below use:
 
-```powershell
-java -cp target/classes <fully.qualified.ClassName> [args...]
+```bash
+java -cp target/classes <fully.qualified.ClassName>
 ```
 
-### Run the Bootstrap Node
+---
 
-Start it in its own terminal:
+## Run — Option A (Recommended): GUI End-to-End
 
-```powershell
+Startup order is important — workers cannot register before the Bootstrap Node exists, and jobs
+need an elected coordinator.
+
+### 1. Start the Server Manager
+
+```bash
+java -cp target/classes com.cs324.backend.gui.ServerGUI
+```
+
+### 2. Start the Bootstrap Node
+
+Click **Start Bootstrap**. The status line turns green: `Bootstrap: running ...` on port `1099`.
+
+### 3. Start the six workers
+
+Click **Start Workers**. The launcher spawns six JVMs (IDs `1..6`, RMI ports `5001..5006`,
+logs `logs/worker-<id>.log`). The state table auto-refreshes and the dashboard should soon show
+`● ONLINE` with `Workers online: 6/6`. Re-running is safe (already-running workers are detected
+via pid files).
+
+### 4. Wait for the automatic election
+
+There is **no election button** — the six workers run a startup timer lottery and elect a
+coordinator by themselves. Within ~10 seconds the dashboard shows `Election: COMPLETE` and
+**Elected Coordinator: Worker N**. The worker whose 150–300 ms countdown expired first claimed
+priority 6 and declared itself the Initial Coordinator (all JACs are 0 at boot). The Startup
+Lottery column shows the minted priority per worker. After each 5-job term the coordinator
+broadcasts Term_End with its final JAC table and a lowest-JAC election runs automatically.
+
+### 5. Launch one or more Clients
+
+In separate terminals (or more than once from anywhere) run:
+
+```bash
+java -cp target/classes com.cs324.frontend.client.ClientGUI
+```
+
+Click **Connect**. The client auto-discovers the coordinator through the Bootstrap Node and its
+dashboard shows `● ONLINE` and `Coordinator: Worker N`. Pick a job type, type (or load) input,
+press **Submit**. Multiple client GUIs can operate simultaneously.
+
+### 6. Submit jobs
+
+See [Job Types & Input Formats](#job-types--input-formats) below.
+
+---
+
+## Run — Option B: Manual Terminals
+
+If you prefer raw processes instead of the Server GUI, each component can also be started from a
+terminal. Everything is configurable; only the fixed worker port layout lives in
+`WorkerClusterConfig`.
+
+### 1. Bootstrap Node
+
+```bash
 java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
+# default RMI registry port 1099; custom: ... BootstrapServer 2099
 ```
 
-The default RMI registry port is `1099`. To use another port:
+### 2. Workers (one JVM each)
 
-```powershell
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 2099
-```
-
-The Bootstrap Node keeps running and waits for workers to register.
-
-### Test with the Included Client
-
-With the Bootstrap Node still running, open another terminal and run:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.BootstrapClientTest
-```
-
-For a custom host or port:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.BootstrapClientTest localhost 2099
-```
-
-The test client registers three workers, prints the active worker list, requests
-a random worker, unregisters one worker, and prints the remaining active workers.
-
-### Run a Worker Node
-
-Start the Bootstrap Node first. Then open another terminal and run a worker:
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerServer 1 5001
-```
-
-Arguments are:
-
-```text
-WorkerServer <workerId> <workerPort> [bootstrapHost] [bootstrapPort] [workerHost]
-```
-
-Example with an explicit Bootstrap Node address:
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerServer 2 5002 localhost 1099 localhost
-```
-
-### Test a Worker Node
-
-With the Bootstrap Node and a Worker Node running, inspect the worker over RMI:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.WorkerClientTest localhost 5001 1
-```
-
-The worker test client prints the worker ID, JAC, coordinator ID, `leaderman`,
-and verifies that neighbours can be added and removed.
-
-### Step-by-Step: Initialize and Start All Six Worker Processes
-
-Prerequisites: Java 17+ and Maven installed, and the project compiled.
-
-#### Step 1 - Compile the project
-
-From the repository root:
-
-```powershell
-mvn clean compile
-```
-
-#### Step 2 - Start the Bootstrap Node
-
-Workers cannot register without it, so start it first in its own terminal:
-
-```powershell
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
-```
-
-Leave this terminal running (default RMI registry port `1099`).
-
-#### Step 3 - Start the six worker processes
-
-Open a second terminal in the repository root and run the launcher:
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher
-```
-
-The launcher spawns six separate JVM processes, one per worker ID `1`-`6`,
-each with:
-
-- its own RMI registry on ports `5001`-`5006`
-- its own log file `logs/worker-<id>.log` (the launcher creates `logs/` if missing)
-- its own pid file `logs/worker-<id>.pid`
-- registration with the Bootstrap Node over Java RMI
-
-After starting, the launcher performs an RMI lookup against every worker and
-prints one `Verified over RMI: worker <id> ...` line per worker, ending with
-`Cluster state: 6/6 workers running`.
-
-Workers that are already running are detected via their pid file and skipped,
-so re-running the command is safe. To point the workers at a Bootstrap Node on
-a custom port, pass it as an argument:
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start localhost 2099
-```
-
-#### Step 4 - Verify the cluster
-
-In a third terminal:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient status
-```
-
-Expected output ends with:
-
-```text
-6/6 workers reachable over RMI
-No coordinator elected yet - run: ClusterStatusClient election [initiatorId]
-```
-
-You can also inspect a single worker directly, e.g. worker 6:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.WorkerClientTest localhost 5006 6
-```
-
-#### Step 5 - Run a leader election
-
-With no coordinator present, initiate an election from any worker (here worker
-1):
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient election 1
-```
-
-Because every worker starts with JAC `0`, the six workers tie and the highest
-worker ID wins:
-
-```text
-Election result: Coordinator elected: worker 6 (JAC=0) across 6 reachable workers [electionId=...]
-...
-Cluster is coordinated by worker 6
-```
-
-All six workers now report `coordinator=6`. While a coordinator is present, a
-new election is refused. Use `reset` (followed by `election`) to re-run:
-
-- Bootstrap terminal: `[Bootstrap] Registered worker: ...`
-- Worker terminals: `NEIGHBOUR connected`, `ELECTION received`,
-  `ELECTION forwarding`, `COORDINATOR broadcast`,
-  `COORDINATOR received`, and `COORDINATOR forwarding`
-- Test terminal: final coordinator view showing every worker with
-  `coordinatorId=6`
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient reset
-```
-
-### Test Distributed MAX Job
-
-Run the 6-worker leader election test first so all reachable workers agree on
-the coordinator. With the default test values, worker `6` becomes coordinator.
-
-Then send a MAX job to worker `6`:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.WorkerMaxClientTest
-```
-
-To provide your own comma-separated numbers:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.WorkerMaxClientTest localhost 5006 6 "4,17,2,99,31,8"
-```
-
-Expected flow:
-
-```text
-Client
-    ↓
-Coordinator receives MAX(numbers)
-    ↓
-Coordinator finds reachable workers
-    ↓
-Coordinator divides the list as evenly as possible
-    ↓
-Each worker computes a partial maximum for its section
-    ↓
-Coordinator combines partial maximums
-    ↓
-Client receives final maximum
-```
-
-Look for these console messages:
-
-- Client terminal: `[Client] Sending MAX job` and `[Client] MAX result`
-- Coordinator terminal: `MAX job received`, `MAX assigning`,
-  `MAX partial result`, and `MAX final result`
-- Worker terminals: `MAX partial compute`
-
-### Test Distributed PRIMECOUNT Job
-
-With the six workers running and a coordinator elected (worker `6` with default
-tie-breaking), send a PRIMECOUNT job to worker `6`:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.PrimeCountClientTest
-```
-
-To provide your own comma-separated numbers:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.PrimeCountClientTest localhost 5006 6 "2,3,4,5,10,17,21,29"
-```
-
-Expected flow:
-
-```text
-Client
-    ↓
-Coordinator receives PRIMECOUNT(numbers)
-    ↓
-Coordinator finds reachable workers
-    ↓
-Coordinator divides the list as evenly as possible
-    ↓
-Each worker counts the primes in its section
-    ↓
-Coordinator sums the partial prime counts
-    ↓
-Client receives the total prime count
-```
-
-Look for these console messages:
-
-- Client terminal: `[Client] Sending PRIMECOUNT job` and `[Client] PRIMECOUNT result`
-- Coordinator terminal: `PRIMECOUNT job received`, `PRIMECOUNT assigning`,
-  `PRIMECOUNT partial result`, and `PRIMECOUNT final result`
-- Worker terminals: `PRIMECOUNT partial compute`
-
-### Test Distributed PRIMESUM Job
-
-With the six workers running and a coordinator elected (worker `6` with default
-tie-breaking), send a PRIMESUM job to worker `6`:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.PrimeSumClientTest
-```
-
-This computes the sum of all prime numbers in the range `[1, 600]`. The
-coordinator divides the range into as many contiguous sub-ranges as there are
-reachable workers, e.g.:
-
-```text
-PRIMESUM(1, 600)
-W1 → 1–100
-W2 → 101–200
-W3 → 201–300
-W4 → 301–400
-W5 → 401–500
-W6 → 501–600
-```
-
-To provide your own range:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.PrimeSumClientTest localhost 5006 6 100 300
-```
-
-Expected flow:
-
-```text
-Client
-    ↓
-Coordinator receives PRIMESUM(start, end)
-    ↓
-Coordinator finds reachable workers
-    ↓
-Coordinator divides the range as evenly as possible
-    ↓
-Each worker sums the primes in its contiguous sub-range
-    ↓
-Coordinator adds the partial sums
-    ↓
-Client receives the total prime sum
-```
-
-Look for these console messages:
-
-- Client terminal: `[Client] Sending PRIMESUM job` and `[Client] PRIMESUM result`
-- Coordinator terminal: `PRIMESUM job received`, `PRIMESUM assigning`,
-  `PRIMESUM partial result`, and `PRIMESUM final result`
-- Worker terminals: `PRIMESUM partial compute`
-
-A PRIMESUM job also spends one of the coordinator's five per-term job slots,
-exactly like MAX and PRIMECOUNT (see the 5-Job Coordinator Term section).
-
-#### Step 6 - Monitor or stop the workers
-
-Check which worker processes are alive:
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher status
-```
-
-Tail a single worker's log (each worker is fully isolated in its own file):
-
-```powershell
-Get-Content logs/worker-1.log -Wait
-```
-
-Stop all six worker processes cleanly (each also unregisters from the
-Bootstrap Node through its shutdown hook):
-
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher stop
-```
-
-Stop the Bootstrap Node by interrupting its terminal (`Ctrl+C`).
-
-#### Starting the workers manually (alternative)
-
-Instead of the launcher you can start each worker in its own terminal. Run the
-Bootstrap Node first, then open six terminals and run one command in each:
-
-```powershell
+```bash
 java -cp target/classes com.cs324.backend.worker.WorkerServer 1 5001
 java -cp target/classes com.cs324.backend.worker.WorkerServer 2 5002
 java -cp target/classes com.cs324.backend.worker.WorkerServer 3 5003
@@ -455,179 +212,92 @@ java -cp target/classes com.cs324.backend.worker.WorkerServer 5 5005
 java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006
 ```
 
-With an explicit Bootstrap Node address:
+Optional trailing args: `WorkerServer <workerId> <port> [bootstrapHost] [bootstrapPort] [workerHost]`.
 
-```powershell
-java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006 localhost 1099 localhost
+### 3. Election
+
+Nothing to do — each worker runs a background check and starts an election on its own once it
+sees no coordinator. Start all six workers within a few seconds of each other and the cluster
+self-elects.
+
+### 4. Client
+
+```bash
+java -cp target/classes com.cs324.frontend.client.ClientGUI
 ```
 
-### ClusterStatusClient Reference
+---
 
-`ClusterStatusClient` drives demos and verification of the six-worker cluster:
+## Job Types & Input Formats
 
-| Command | Purpose |
-|---------|---------|
-| `status [host] [bootstrapPort]` | Print Bootstrap registration and per-worker state (JAC, `jobsThisTerm`, coordinator, neighbour count). |
-| `election [initiatorId] [host] [bootstrapPort]` | Have the given worker (default `1`) start a leader election, then re-print status. |
-| `reset [host] [bootstrapPort]` | Set every worker's coordinator back to `-1`, so a new election can be run. |
-| `bump-jac <workerId> <amount> [host] [bootstrapPort]` | Increase a worker's JAC to exercise JAC-priority tie-breaking. |
+| Job type | Input | Example | Result |
+|----------|-------|---------|--------|
+| `MAX` | comma-separated integers | `12,5,99,2,17` | largest number |
+| `PRIMECOUNT` | comma-separated integers | `2,4,5,8,11` | number of primes (duplicates count) |
+| `PRIMESUM` | `start,end` (inclusive range) | `1,1000` | sum of primes in the range |
 
-### Tie-Breaking Example
+### CSV formats
 
-The election prefers the lowest JAC. To prove it, raise worker 6's JAC so its
-JAC is no longer the minimum, then re-elect:
+- `MAX` / `PRIMECOUNT`: one line of comma-separated integers, e.g. `12,5,99,2,17`.
+- `PRIMESUM`: one line with two values, e.g. `1,1000`.
 
-```powershell
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient reset
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient bump-jac 6 3
-java -cp target/classes com.cs324.frontend.client.ClusterStatusClient election 5
-```
+Malformed values (non-numeric, empty, `start > end`, `start < 1`) produce a clear error in the
+task table instead of crashing.
 
-This time the winner is worker `5` (`JAC=0`): workers `1`-`5` are tied on the
-lowest JAC and the tie is broken by the highest worker ID:
+The coordinator splits each task into a **variable number of contiguous segments** for the
+reachable workers — MAX/PRIMECOUNT use `⌈n / 3⌉` segments, PRIMESUM uses `⌈range / 200⌉` —
+ranking workers by **JAC** (least-loaded first) and incrementing the receiving worker's JAC for
+each segment. A fresh `PRIMESUM(1, 1000)` therefore splits into five ranges of ~200 numbers and a
+10-number MAX into four groups. Partial results are merged back at the coordinator, which returns
+the final answer to the requesting client.
 
-```text
-Election result: Coordinator elected: worker 5 (JAC=0) across 6 reachable workers [electionId=...]
-```
+### Ready-made sample CSV files
 
-### Coordinator Job-Allocation Tracking (JAC)
+The project ships sample files in the `csv/` folder — open the client GUI, pick the matching job
+type, press **Load CSV...**, choose a file and press **Submit**.
 
-While a worker is coordinator, every section it delegates to another worker is a
-job allocation: the coordinator's Job Acceptance Counter (JAC) is incremented
-for each remote assignment via `recordJobAllocation()`. The coordinator's own
-section is not counted as an allocation.
+| File | Job type | Contents | Expected result |
+|------|----------|----------|-----------------|
+| `csv/max.csv` | `MAX` | `12,5,99,2,17,45,8,76,31,50,3,88` | `99` |
+| `csv/max-small.csv` | `MAX` | `7,3,21,14,9,1,42` | `42` |
+| `csv/primecount.csv` | `PRIMECOUNT` | `2,6,11,15,17,20,23,29,31,40,47,53,60,67,71,80` | `10` |
+| `csv/primesum.csv` | `PRIMESUM` | `1,1000` | `76127` |
+| `csv/primesum-range.csv` | `PRIMESUM` | `100,600` | `28236` |
 
-During a MAX job, each delegated remote section increments the coordinator's
-JAC. Look for these messages on the coordinator terminal:
+## Stopping the Cluster Cleanly
 
-```text
-[Worker 6] JAC changed to 1 (assigned a job section to another worker)
-[Worker 6] JAC changed to 2 (assigned a job section to another worker)
-```
+- **Server GUI**: click **Stop Workers** (each worker unregisters via its shutdown hook), then
+  close the GUI.
+- **Manual**: `Ctrl+C` the worker terminals, then the Bootstrap terminal.
+- Left-over pid/log files are cleaned automatically or re-detected on the next start.
 
-Because elections prefer the worker with the lowest JAC, JAC growth directly
-influences future leadership: after a coordinator has delegated enough work,
-`reset` the coordinators and run a new election to let lower-JAC workers
-become coordinator (see the tie-breaking example above).
+---
 
-### 5-Job Coordinator Term
+## Troubleshooting
 
-A coordinator may process at most **5 submitted jobs** in a single term. Each
-complete client job (MAX or PRIMECOUNT) consumes one of the five slots. The
-per-term counter `jobsThisTerm` is **kept completely separate from the JAC**:
-the JAC counts every job section a worker handles (including partial computes),
-while `jobsThisTerm` counts only whole jobs submitted to the coordinator.
+| Symptom | Fix |
+|---------|-----|
+| `Connection refused` on worker/client start | Start the Bootstrap Node first; check the port numbers. |
+| `Worker N is not the coordinator` | A term just ended and a new election is running; press Connect again or simply resubmit — the client auto-re-resolves the new coordinator. |
+| `Coordinator term ended after 5 jobs ...` | Expected — the term expired; the cluster is re-electing and the next submission goes to the new coordinator. |
+| Port already in use | Another instance is running (pid files skip it); stop it first. |
+| GUI shows `ELECTING...` for a long time | Seconds-long is normal right after a term ends. If it persists, stop and restart the workers so they all re-run their staggered auto-election checks. |
 
-How the term works:
+## Known Limitations
 
-1. A job that arrives when the coordinator still has budget claims a slot
-   (`jobsThisTerm` goes 1 → 2 → 3 → 4 → 5).
-2. Right after the fifth job completes, the coordinator **demotes itself**
-   back to `NO_COORDINATOR` and immediately starts a **new distributed leader
-   election**.
-3. While that election is running, no jobs can be processed: submissions are
-   refused with `Coordinator term ended after 5 jobs; no jobs can be processed
-   until the next leader election completes` (or are refused because no
-   coordinator is present yet).
-4. Every worker records the newly elected coordinator; if a worker is elected
-   coordinator, its `jobsThisTerm` resets to zero for the fresh term.
+- The neighbour graph is a ring backbone plus random connections, not a purely random graph; this
+  deliberately guarantees reachability (so the cluster always agrees on one coordinator) while
+  still satisfying the "random connection on join / unstructured subset" requirement.
+- Worker discovery is centralised in the Bootstrap Node (documented decision); workers that are
+  already running keep working if only the Bootstrap Node goes down, but new workers cannot join.
+- The fixed cluster layout is 6 workers (IDs `1..6`, ports `5001..5006`).
+- When starting workers manually one-by-one in separate terminals, start them within a few
+  seconds of each other so the first automatic election covers the whole cluster.
 
-Because re-elections use the normal JAC-based rules, a coordinator that
-delegated a lot of work is not automatically re-elected. In the logs below the
-term-1 coordinator (worker 6, `JAC=30`) hands over to worker 5 (`JAC=5`):
+## Tests
 
-```text
-[Worker 6] completed 5 jobs this term - ending term and starting a new leader election
-[Worker 6] term re-election result: Coordinator elected: worker 5 (JAC=5) across 6 reachable workers [electionId=...]
-[Worker 6] coordinator set to 5 (was -1)
-```
-
-`ClusterStatusClient status` now also prints `jobsThisTerm` for every worker so
-you can watch the budget fill:
-
-```text
-Worker 6 OK: JAC=30, jobsThisTerm=5, coordinator=5, neighbours=2, leaderman=cs324
-```
-
-**Test procedure (deterministic):** with the six workers running and a
-coordinator elected, submit the MAX job five times from five client terminals:
-
-```powershell
-java -cp target/classes com.cs324.frontend.client.WorkerMaxClientTest
-```
-
-After the 5th result returns, the coordinator's terminal shows `completed 5
-jobs this term` followed by the term re-election result, and the cluster is
-coordinated by a fresh leader. A 6th submission sent while the old term is
-still the active coordinator is rejected until the new leader is announced.
-
-### Multithreaded Job Execution
-
-Each Worker Node owns a single `ExecutorService` (one shared pool per process).
-Both coordinator jobs (`submitMaxJob`, `submitPrimeCount`) and partial
-computations (`computePartialMax`, `countPrimes`) run on that pool, so several
-clients can be served in parallel on one worker.
-
-**Synchronization strategy** — every shared value is a concurrent primitive, so
-no coarse locks are needed around the job logic:
-
-| Shared state                     | Primitive                     |
-|----------------------------------|-------------------------------|
-| JAC (`jobAllocationCounter`)     | `AtomicInteger`               |
-| Per-term job counter             | `AtomicInteger` (CAS claims)  |
-| Coordinator id                   | `AtomicInteger` (CAS for the term hand-over) |
-| Processed election ids           | `ConcurrentHashMap.newKeySet()` |
-| Neighbour ring                   | `ConcurrentHashMap.newKeySet()`, replaced atomically in a `synchronized` `refreshNeighbours()` |
-
-The job pool is sized larger than the 5-job term limit
-(`max(6, availableProcessors)`), which guarantees the coordinator never
-deadlocks when it runs five concurrent jobs and still needs to borrow one more
-thread to compute its own local section. Executor threads are daemon threads so
-they never keep a worker JVM alive after it is shut down.
-
-To see the multithreading in action, check the worker logs while clients submit
-overlapping jobs - each job logs the pool thread running it:
-
-```text
-[Worker 5] submitted job #2 -> queued on executor
-[Worker 5] executing submitted job #2 on thread job-5-1
-[Worker 5] executing submitted job #3 on thread job-5-2
-```
-
-If more jobs are submitted than the current term allows, the surplus is refused
-instead of being queued into the next term:
-
-```text
-java.rmi.RemoteException: Coordinator term ended after 5 jobs; no jobs can be processed until the next leader election completes
-```
-
-### Watching the Election Propagate
-
-Each worker logs its election activity in its own file. During an election you
-can watch the ELECTION messages hop around the ring and see deduplication in
-action:
-
-```text
-[Worker 1] election <electionId> started, JAC=0, neighbours=2
-[Worker 2] dropping duplicate election message <electionId> from worker 3
-...
-[Worker 6] dropping duplicate election message <electionId> from worker 1
-[Worker 1] election <electionId> winner: worker 6 (JAC=0) across 6 reachable workers
-```
-
-Because each worker processes an election id at most once, the second arrival of
-every message is dropped and the flood terminates after every reachable worker
-has been discovered once.
-
-### Why the Bootstrap Node Stays Neutral
-
-The Bootstrap Node's log only ever shows registrations and unregistrations:
-
-```text
-[Bootstrap] Registered worker: WorkerInfo{workerId=1, host='localhost', port=5001}
-...
-```
-
-Elections, winner selection and coordination are entirely between worker nodes:
-the bootstrap merely answers `getActiveWorkers()`, which the workers use to
-rebuild their neighbour ring and discover each other over RMI.
+The repository previously shipped console test harnesses; these were replaced by the two GUIs:
+`ServerGUI` exercises registration, election and status checks, and `ClientGUI` exercises all
+three computation jobs (manual and CSV input, concurrent submissions, failure display, automatic
+coordinator re-resolution after term hand-over). Run every scenario described above to validate
+the system end-to-end.
