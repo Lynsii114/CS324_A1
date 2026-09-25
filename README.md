@@ -1,4 +1,4 @@
-# CS324 A1 — Distributed Computing Cluster (Bootstrap / Workers / Election)
+# Distributed Computing Cluster
 
 ## Project Overview
 
@@ -282,22 +282,3 @@ type, press **Load CSV...**, choose a file and press **Submit**.
 | `Coordinator term ended after 5 jobs ...` | Expected — the term expired; the cluster is re-electing and the next submission goes to the new coordinator. |
 | Port already in use | Another instance is running (pid files skip it); stop it first. |
 | GUI shows `ELECTING...` for a long time | Seconds-long is normal right after a term ends. If it persists, stop and restart the workers so they all re-run their staggered auto-election checks. |
-
-## Known Limitations
-
-- The neighbour graph is a ring backbone plus random connections, not a purely random graph; this
-  deliberately guarantees reachability (so the cluster always agrees on one coordinator) while
-  still satisfying the "random connection on join / unstructured subset" requirement.
-- Worker discovery is centralised in the Bootstrap Node (documented decision); workers that are
-  already running keep working if only the Bootstrap Node goes down, but new workers cannot join.
-- The fixed cluster layout is 6 workers (IDs `1..6`, ports `5001..5006`).
-- When starting workers manually one-by-one in separate terminals, start them within a few
-  seconds of each other so the first automatic election covers the whole cluster.
-
-## Tests
-
-The repository previously shipped console test harnesses; these were replaced by the two GUIs:
-`ServerGUI` exercises registration, election and status checks, and `ClientGUI` exercises all
-three computation jobs (manual and CSV input, concurrent submissions, failure display, automatic
-coordinator re-resolution after term hand-over). Run every scenario described above to validate
-the system end-to-end.
