@@ -12,13 +12,6 @@ and never executes a segment — merges the partial results, records exactly whi
 processed each task, and returns the final answer plus the used-worker list to the requesting
 client.
 
-Each worker runs in its own JVM with its own RMI registry port, its own log file and its own
-pid file. Workers only know their direct neighbours (a ring backbone built from the Bootstrap
-registry plus random connections so new workers are randomly linked to an active worker), but
-elections and job distribution reason over **all reachable active workers** by forwarding messages
-hop-by-hop over the neighbour graph.
----
-
 ## Assignment Requirements
 
 ### Non-Functional Requirements
