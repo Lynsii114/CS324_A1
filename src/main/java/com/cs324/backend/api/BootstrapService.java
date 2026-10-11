@@ -36,4 +36,7 @@ public interface BootstrapService extends Remote {
 
     /** Epoch millis at which all {@code WORKER_COUNT} workers had registered, or {@code 0}. */
     long getClusterCompleteTime() throws RemoteException;
+
+    /** Total number of worker nodes this cluster is configured with (minimum 6). */
+    int getClusterSize() throws RemoteException;
 }

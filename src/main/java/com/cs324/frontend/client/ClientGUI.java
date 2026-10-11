@@ -92,7 +92,7 @@ public class ClientGUI extends JFrame {
     /**
      * This client's identifier. Sent with every submission so the elected
      * coordinator can correlate the distributed task back to the client that
-     * asked for it (visible in the Server Manager's task distribution view).
+     * asked for it (shown in the client's task table).
      */
     private final String clientId = "client-" + UUID.randomUUID().toString().substring(0, 8);
 
@@ -101,6 +101,7 @@ public class ClientGUI extends JFrame {
     private volatile BootstrapService bootstrap;
     private volatile WorkerService coordinator;
     private volatile int activeWorkerCount;
+    private volatile int clusterSize = WorkerClusterConfig.WORKER_COUNT;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> new ClientGUI().setVisible(true));
@@ -348,6 +349,11 @@ public class ClientGUI extends JFrame {
             bootstrap = foundBootstrap;
             List<WorkerInfo> active = foundBootstrap.getActiveWorkers();
             activeWorkerCount = active.size();
+            try {
+                clusterSize = foundBootstrap.getClusterSize();
+            } catch (Exception e) {
+                clusterSize = Math.max(activeWorkerCount, WorkerClusterConfig.WORKER_COUNT);
+            }
             int coordinatorId = findCoordinatorId(foundBootstrap);
             WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
                     ? null
@@ -356,7 +362,7 @@ public class ClientGUI extends JFrame {
             final int elected = coordinatorId;
             SwingUtilities.invokeLater(() -> {
                 connectButton.setEnabled(true);
-                workersValue.setText(activeWorkerCount + "/" + WorkerClusterConfig.WORKER_COUNT);
+                workersValue.setText(activeWorkerCount + "/" + clusterSize);
                 if (elected == WorkerService.NO_COORDINATOR) {
                     connectionStatus.setForeground(UITheme.WARNING);
                     connectionStatus.setText("Connected - no coordinator yet");

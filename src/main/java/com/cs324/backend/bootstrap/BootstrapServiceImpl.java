@@ -111,4 +111,9 @@ public class BootstrapServiceImpl extends UnicastRemoteObject implements Bootstr
     public long getClusterCompleteTime() throws RemoteException {
         return clusterCompleteAt;
     }
+
+    @Override
+    public int getClusterSize() throws RemoteException {
+        return WorkerClusterConfig.WORKER_COUNT;
+    }
 }

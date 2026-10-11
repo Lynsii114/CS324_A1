@@ -57,10 +57,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>The winner is the reachable worker with the lowest JAC; ties are broken
  *       by the highest startup priority id (minted by the Phase-1 timer lottery),
  *       then the highest worker id as a safety net.</li>
- *   <li>Phase 1: on a fresh cluster the six workers run a randomized countdown
- *       (150-300 ms); the first to expire claims priority 6, the next 5, down to
- *       1. All JACs are still 0, so the priority-6 worker declares itself the
- *       Initial Coordinator and alerts the other five.</li>
+ *   <li>Phase 1: on a fresh cluster the N workers (minimum 6) run a randomized
+ *       countdown (150-300 ms); the first to expire claims priority N, the next
+ *       N-1, down to 1. All JACs are still 0, so the priority-N worker declares
+ *       itself the Initial Coordinator and alerts the other N-1 workers.</li>
  *   <li>Phase 2: the coordinator re-splits each incoming task into a variable
  *       number of contiguous segments (never more than one per worker, sized by
  *       the input) and hands them to the lowest-JAC workers; every worker that
@@ -127,8 +127,9 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
     private static final int MAX_TASK_HISTORY = 50;
     private final Deque<TaskResult> taskHistory = new ConcurrentLinkedDeque<>();
 
-    /** Startup-lottery priority id (1..6); 6 = highest. Minted at boot by the
-     * randomized countdown lottery and used as the election tie-breaker. */
+    /** Startup-lottery priority id (1..N, N = configured worker count); N = highest.
+     * Minted at boot by the randomized countdown lottery and used as the election
+     * tie-breaker. */
     private volatile int priorityId = 0;
 
     /** Wall-clock time this worker's randomized countdown expires (Phase 1). */
@@ -1189,8 +1190,8 @@ public class WorkerServiceImpl extends UnicastRemoteObject implements WorkerServ
      * {@link #getReachableWorkerServices()} (least-loaded JAC first, then startup
      * priority, then worker id). The coordinator only assigns and compiles - it
      * never executes a segment itself, so a task is always shared between the
-     * worker nodes, and with six workers each task fans out over at most the
-     * other five nodes.
+     * worker nodes, and with N worker nodes each task fans out over at most the
+     * other N-1 nodes.
      */
     private List<WorkerService> getAssignmentWorkers() throws RemoteException {
         List<WorkerService> reachable = getReachableWorkerServices();

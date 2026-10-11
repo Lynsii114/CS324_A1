@@ -18,13 +18,14 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * Launches the six configured Worker Nodes (IDs 1-6) as six independent JVM
- * processes. Each process gets its own RMI registry port, its own log file and
- * its own pid file, so the workers stay fully isolated while still talking to
- * each other (and to the Bootstrap Node) through Java RMI.
+ * Launches {@code WorkerClusterConfig.WORKER_COUNT} worker nodes (default 6,
+ * minimum 6) as independent JVM processes. Each process gets its own RMI
+ * registry port, its own log file and its own pid file, so the workers stay
+ * fully isolated while still talking to each other (and to the Bootstrap Node)
+ * through Java RMI.
  *
  * Usage:
- *   WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort]
+ *   WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort] [workerCount]
  */
 public final class WorkerClusterLauncher {
 
@@ -36,6 +37,11 @@ public final class WorkerClusterLauncher {
 
     public static void main(String[] args) throws Exception {
         String command = args.length > 0 ? args[0] : "start";
+        // Apply an optional worker count BEFORE WorkerClusterConfig is first
+        // loaded, so this JVM and every spawned worker agree on the cluster size.
+        if (args.length > 3 && "start".equals(command)) {
+            System.setProperty(WorkerClusterConfig.WORKER_COUNT_PROPERTY, args[3]);
+        }
         String bootstrapHost = args.length > 1 ? args[1] : WorkerClusterConfig.DEFAULT_HOST;
         int bootstrapPort = args.length > 2 ? Integer.parseInt(args[2]) : BootstrapServer.DEFAULT_PORT;
 
@@ -45,13 +51,14 @@ public final class WorkerClusterLauncher {
             case "status" -> status();
             default -> {
                 System.err.println("Unknown command: " + command);
-                System.err.println("Usage: WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort]");
+                System.err.println("Usage: WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort] [workerCount]");
                 System.exit(1);
             }
         }
     }
 
     public static List<Integer> start(String bootstrapHost, int bootstrapPort) throws Exception {
+        warnOnSizeMismatch(bootstrapHost, bootstrapPort);
         Path logDir = Paths.get(WorkerClusterConfig.LOG_DIR);
         Files.createDirectories(logDir);
 
@@ -75,7 +82,7 @@ public final class WorkerClusterLauncher {
             if (isReachableOverRmi(workerId, bootstrapHost)) {
                 // A worker is already serving this port, but the pid file is stale or was
                 // never written (e.g. launched manually, or left over from a previous
-                // Server Manager session). Do not spawn a duplicate; reclaim its tracking
+                // session). Do not spawn a duplicate; reclaim its tracking
                 // so Start/Stop stay consistent.
                 alreadyRunning.add(workerId);
                 List<Long> orphans = findRunningPids(workerId, port);
@@ -93,6 +100,7 @@ public final class WorkerClusterLauncher {
 
             ProcessBuilder builder = new ProcessBuilder(
                     javaBin,
+                    "-D" + WorkerClusterConfig.WORKER_COUNT_PROPERTY + "=" + WorkerClusterConfig.WORKER_COUNT,
                     "-cp", classpath,
                     WorkerServer.class.getName(),
                     String.valueOf(workerId),
@@ -122,7 +130,31 @@ public final class WorkerClusterLauncher {
         return started;
     }
 
-    /** Polls each worker's own RMI registry until the worker is reachable. */
+    /** Warns when the bootstrap advertises a different cluster size than this launcher JVM. */
+    private static void warnOnSizeMismatch(String bootstrapHost, int bootstrapPort) {
+        try {
+            Registry registry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
+            com.cs324.backend.api.BootstrapService bootstrap =
+                    (com.cs324.backend.api.BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
+            int expected = bootstrap.getClusterSize();
+            if (expected != WorkerClusterConfig.WORKER_COUNT) {
+                System.err.println("WARNING: Bootstrap Node is configured for " + expected
+                        + " worker node(s) but this launcher is configured for "
+                        + WorkerClusterConfig.WORKER_COUNT
+                        + ". Launch via 'BootstrapServer [port] [workerCount]' or pass a matching "
+                        + "workerCount so the whole cluster agrees.");
+            }
+        } catch (Exception e) {
+            // Bootstrap not reachable yet - let the normal startup report that.
+            System.err.println("Bootstrap Node not reachable at " + bootstrapHost + ":" + bootstrapPort
+                    + " - start it first with 'java -cp target/classes "
+                    + "com.cs324.backend.bootstrap.BootstrapServer [port] [workerCount]");
+        }
+    }
+
+    /**
+     * Polls each worker's own RMI registry until the worker is reachable.
+     */
     private static void verifyOverRmi(List<Integer> workerIds, String host) {
         long deadline = System.currentTimeMillis() + LOOKUP_TIMEOUT_MS;
         List<Integer> pending = new ArrayList<>(workerIds);
@@ -218,7 +250,7 @@ public final class WorkerClusterLauncher {
     /**
      * True when this worker's pid file exists and the recorded process is still
      * alive - i.e. the worker was launched (and is being tracked) by this
-     * Server Manager / launcher.
+     * launcher.
      */
     public static boolean isManagedAndAlive(int workerId) {
         Path pidFile = Paths.get(WorkerClusterConfig.LOG_DIR, pidFileName(workerId));
@@ -241,7 +273,7 @@ public final class WorkerClusterLauncher {
      * Finds every live JVM running our WorkerServer command line for <i>workerId</i>
      * on <i>port</i>, regardless of whether a pid file tracks it. This is what lets
      * Start avoid duplicates and Stop reclaim orphaned workers that a previous
-     * Server Manager session left behind.
+     * session left behind.
      */
     private static List<Long> findRunningPids(int workerId, int port) {
         Pattern pattern = Pattern.compile(
