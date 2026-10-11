@@ -19,7 +19,7 @@ public interface WorkerService extends Remote {
 
     int getWorkerId() throws RemoteException;
 
-    /** Startup-lottery priority id (1..6), {@code 0} until the lottery minted it. */
+    /** Startup-lottery priority id (1..N, N = configured worker count), {@code 0} until the lottery minted it. */
     int getPriorityId() throws RemoteException;
 
     int getJobAllocationCounter() throws RemoteException;
@@ -112,7 +112,7 @@ public interface WorkerService extends Remote {
 
     /**
      * Recent distributed-task records this worker produced while acting as the
-     * coordinator (newest first). Used by the Server Manager to show which
+     * coordinator (newest first). Used to show which
      * worker nodes processed the tasks of different clients.
      */
     List<TaskResult> getTaskHistory() throws RemoteException;

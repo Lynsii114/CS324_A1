@@ -37,7 +37,7 @@ public final class CandidateInfo implements Serializable {
         return jac;
     }
 
-    /** Startup-lottery priority id (1..6); used as the election tie-breaker. */
+    /** Startup-lottery priority id (1..N, N = configured worker count); used as the election tie-breaker. */
     public int getPriorityId() {
         return priorityId;
     }

@@ -1,8 +1,9 @@
 # Distributed Computing Cluster (CS324)
 
-A distributed computing cluster built with **Java RMI**. Six independent worker JVMs form an
-unstructured network, a neutral **Bootstrap Node** tracks membership, and a distributed **leader
-election** lets the workers agree on a **Coordinator** for one term at a time. Clients submit jobs
+A distributed computing cluster built with **Java RMI**. At least six independent worker JVMs
+(extra nodes can be added at startup) form an unstructured network, a neutral **Bootstrap Node**
+tracks membership, and a distributed **leader election** lets the workers agree on a
+**Coordinator** for one term at a time. Clients submit jobs
 (MAX, PRIMECOUNT, PRIMESUM); the coordinator tags each client request with a **task ID**, splits
 the work into a variable number of contiguous segments, hands every segment to the least-loaded
 worker **nodes** (never executing a segment itself), merges the partial results, records exactly
@@ -18,8 +19,8 @@ requesting client.
 3. [Requirements & Tools](#requirements--tools)
 4. [Configuration](#configuration)
 5. [Building the Project](#building-the-project)
-6. [Running the Entire System — Option A (GUI, Recommended)](#running-the-entire-system-option-a-gui-recommended)
-7. [Running the Entire System — Option B (Manual Terminals)](#running-the-entire-system-option-b-manual-terminals)
+6. [Running the Entire System — Option A (One Terminal Command, Recommended)](#running-the-entire-system-option-a-one-terminal-command-recommended)
+7. [Running the Entire System — Option B (Manual or Separate Terminals)](#running-the-entire-system-option-b-manual-or-separate-terminals)
 8. [Job Types & Input Formats](#job-types--input-formats)
 9. [How the Cluster Works (Election, Tasks, Terms)](#how-the-cluster-works)
 10. [Stopping the Cluster](#stopping-the-cluster)
@@ -29,7 +30,8 @@ requesting client.
 
 ## What the Program Does
 
-- Six **worker nodes** (IDs `1..6`) each run in their own JVM with their own RMI registry and port.
+- At least six **worker nodes** (IDs `1..N`, six by default, minimum six) each run in their own JVM
+  with their own RMI registry and port.
 - A **Bootstrap Node** keeps the membership list — it never runs jobs and never takes part in
   elections.
 - The workers **elect a Coordinator** automatically. On startup a randomized timer lottery picks an
@@ -43,8 +45,9 @@ requesting client.
   4. merges the partial results and returns a `TaskResult` to the client with the task ID, the
      client ID, the segment count, the exact worker list used and the final answer.
 
-A Server Manager GUI lets you start/stop the whole cluster, watch worker state, and see which
-worker nodes are processing which clients' tasks.
+There is **no server GUI**. Everything runs from the terminal: starting the Bootstrap Node also
+launches every worker node (one JVM each), the workers elect a coordinator on their own, and a
+client GUI handles job submission.
 
 ---
 
@@ -72,8 +75,8 @@ change host/ports, edit these files:
 | Setting | Where | Default |
 |---------|-------|---------|
 | Bootstrap RMI registry port | `BootstrapServer.DEFAULT_PORT` | `1099` |
-| Number of workers | `WorkerClusterConfig.WORKER_COUNT` | `6` |
-| Worker IDs | `WorkerClusterConfig.FIRST_WORKER_ID` / `LAST_WORKER_ID` | `1` / `6` |
+| Number of workers | system property `cs324.worker.count` (or `BootstrapServer [port] [workerCount]`) | `6` (minimum `6`) |
+| Worker IDs | `WorkerClusterConfig.FIRST_WORKER_ID` / `LAST_WORKER_ID` | `1` / `N` (N = configured count) |
 | Base worker RMI port (worker *id* → *BASE + id − 1*) | `WorkerClusterConfig.BASE_WORKER_PORT` | `5001` |
 | Default host | `WorkerClusterConfig.DEFAULT_HOST` | `localhost` |
 | Worker log directory | `WorkerClusterConfig.LOG_DIR` | `logs` |
@@ -94,6 +97,9 @@ Port layout used by the cluster (fixed, don't run other services on these):
 | Worker 5 | `localhost:5005` |
 | Worker 6 | `localhost:5006` |
 
+Extra worker nodes continue the pattern: worker *N* uses `localhost:5000 + N` (e.g. workers 7 and 8
+use `5007` and `5008`).
+
 Hosts and ports can also be overridden per-launch via command-line arguments (see the launch
 sections below) instead of editing source.
 
@@ -113,42 +119,38 @@ java -cp target/classes <fully.qualified.ClassName>
 
 ---
 
-## Running the Entire System — Option A (GUI, Recommended)
+## Running the Entire System — Option A (One Terminal Command, Recommended)
 
-The Server Manager controls everything from one window, so this is the easiest path. **Startup
-order matters:** workers cannot register before the Bootstrap Node exists, and jobs need an elected
-coordinator.
+There is **no server GUI** anymore. The Bootstrap Node itself launches every worker node in its
+own JVM when it starts, so **one command** runs the whole cluster (no manual startup order).
 
-### Step 1 — Start the Server Manager
+### Step 1 — Start the Bootstrap Node (this also starts all workers)
 
 ```bash
-java -cp target/classes com.cs324.backend.gui.ServerGUI
+# default cluster: bootstrap RMI registry on port 1099 + the 6 default workers
+java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
+
+# custom bootstrap port (still the 6 default workers)
+java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 2099
+
+# spin up extra worker nodes on top of the default 6 (minimum is 6): 8 workers here
+java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 1099 8
 ```
 
-A window opens with a dashboard (network, elected coordinator, election status), the **Worker
-Status** and **Client Task Distribution** tabs (auto-refresh every ~2.5 s), and a log panel.
+The bootstrap binds its RMI registry, spawns one JVM per worker node (IDs `1..N`, RMI ports
+`5001..5000+N`, logs `logs/worker-<id>.log`), waits until the configured count has registered and
+verifies each node over RMI. Press **Ctrl+C** (or `kill <pid>`) to stop the whole cluster again.
 
-### Step 2 — Start the Bootstrap Node
+### Step 2 — Wait for the automatic election
 
-Click **Start Bootstrap**. The status line turns green: `Bootstrap: running ...` on port `1099`.
-
-### Step 3 — Start the six workers
-
-Click **Start Workers**. The launcher spawns six JVMs (IDs `1..6`, RMI ports `5001..5006`, logs
-`logs/worker-<id>.log`) and verifies each one over RMI. The dashboard should soon show `● ONLINE`
-with `Workers online: 6/6`. Re-running is safe — already-running workers are detected via pid files
-and RMI probes, so no duplicate processes are spawned. **Stop Workers** reclaims them.
-
-### Step 4 — Wait for the automatic election
-
-There is **no election button**. Within ~10 seconds the dashboard shows `Election: COMPLETE` and
-**Elected Coordinator: Worker N**:
-- On a cold start a randomized 150–300 ms timer lottery mints startup priorities `1..6`; the
-  priority-6 worker declares itself the Initial Coordinator.
+There is **no election button**. Within ~10 seconds the workers agree on the coordinator (see the
+bootstrap/worker logs):
+- On a cold start a randomized 150–300 ms timer lottery mints startup priorities `N..1`; the
+  priority-`N` worker declares itself the Initial Coordinator.
 - After every 5-job term the coordinator broadcasts Term_End and the cluster re-elects the
   lowest-JAC worker automatically (see [How the Cluster Works](#how-the-cluster-works)).
 
-### Step 5 — Launch one or more Clients
+### Step 3 — Launch one or more Clients
 
 In separate terminals (run any number of client GUIs simultaneously):
 
@@ -159,39 +161,40 @@ java -cp target/classes com.cs324.frontend.client.ClientGUI
 Click **Connect**. The client auto-discovers the coordinator through the Bootstrap Node and shows
 `● ONLINE` and `Coordinator: Worker N`.
 
-### Step 6 — Submit jobs
+### Step 4 — Submit jobs
 
 Pick a job type, type (or load) the input, press **Submit**. See
 [Job Types & Input Formats](#job-types--input-formats) below for accepted input.
 
-### Step 7 — Watch the results
+### Step 5 — Watch the results
 
 - **Client GUI** — its task table lists each job: type, submit time, status, coordinator, the
   **worker nodes** the task was split over, the task's short ID and the **merged result**.
-- **Server Manager → Worker Status tab** — per-worker online state, JAC, `jobsThisTerm`, agreement
-  on the coordinator, neighbour count and startup priority.
-- **Server Manager → Client Task Distribution tab** — every task a coordinator has compiled: time,
-  task ID, **client**, job type, segment count, the exact **worker nodes** used, and the result.
-  Different clients appear side-by-side with their distinct worker lists.
+- **Worker logs** (`logs/worker-<id>.log`) — per-worker online state, JAC, `jobsThisTerm`,
+  agreement on the coordinator, neighbour count and startup priority.
+- **Bootstrap log (the terminal)** — membership claims, `Cluster complete: N/N workers registered`,
+  startup lottery priorities, unregistrations and the shutdown summary.
 
 ---
 
-## Running the Entire System — Option B (Manual Terminals)
+## Running the Entire System — Option B (Manual or Separate Terminals)
 
-If you prefer raw processes (no Server Manager), start each component from a shell. Everything is
-configurable via arguments; only the fixed worker port layout lives in code.
+If you prefer raw processes (no single bootstrap command), start each component from a shell.
+Everything is configurable via arguments; only the fixed worker port layout lives in code.
 
-### Step 1 — Start the Bootstrap Node
+### Step 1 — Start the Bootstrap Node alone
 
 ```bash
-# default RMI registry port 1099
+# default RMI registry port 1099, no workers launched
 java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
 
 # custom port, e.g. 2099
 java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 2099
 ```
 
-### Step 2 — Start the six workers (one JVM each)
+### Step 2 — Start the workers (one JVM each)
+
+Either run `WorkerServer` manually (IDs `1..N`, RMI ports `5001..5000+N`):
 
 ```bash
 java -cp target/classes com.cs324.backend.worker.WorkerServer 1 5001
@@ -200,6 +203,9 @@ java -cp target/classes com.cs324.backend.worker.WorkerServer 3 5003
 java -cp target/classes com.cs324.backend.worker.WorkerServer 4 5004
 java -cp target/classes com.cs324.backend.worker.WorkerServer 5 5005
 java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006
+# extra nodes beyond the default six:
+java -cp target/classes com.cs324.backend.worker.WorkerServer 7 5007
+java -cp target/classes com.cs324.backend.worker.WorkerServer 8 5008
 ```
 
 Optional trailing arguments (only needed when something is not on `localhost`):
@@ -211,8 +217,8 @@ WorkerServer <workerId> <port> [bootstrapHost] [bootstrapPort] [workerHost]
 ### Step 3 — Wait for the automatic election
 
 Nothing to do — each worker runs a background check and starts an election on its own once it sees
-no coordinator. Start all six workers within a few seconds of each other and the cluster
-self-elects within ~10 seconds.
+no coordinator. Start all workers within a few seconds of each other and the cluster self-elects
+within ~10 seconds.
 
 ### Step 4 — Run the clients
 
@@ -223,11 +229,14 @@ java -cp target/classes com.cs324.frontend.client.ClientGUI
 ### Launcher convenience commands (bash, not a GUI)
 
 ```bash
-# start all six workers against a bootstrap on localhost:1099
+# start the 6 default workers against a bootstrap on localhost:1099
 java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start
 
 # custom bootstrap
 java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099
+
+# add extra nodes (here a 9-worker cluster): extra nodes spawn on top of the default 6
+java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099 9
 
 # stop all workers started by the launcher, reusing its pid files
 java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher stop
@@ -290,14 +299,14 @@ The protocol runs in three phases.
 
 ### Phase 1 — Startup & Initial Leader Election (Timer Lottery)
 
-1. All six workers boot with `JAC = 0` and no coordinator.
-2. When the Bootstrap Node reports the cluster complete (6/6 registered), every worker starts a
+1. All N workers (N defaults to 6; minimum 6) boot with `JAC = 0` and no coordinator.
+2. When the Bootstrap Node reports the cluster complete (N/N registered), every worker starts a
    **randomized countdown of 150–300 ms**.
-3. The first worker whose countdown expires claims **startup priority 6**, the second **priority 5**,
-   … the last **priority 1** (the Bootstrap Node sequences the claims, so each cold start mints
-   priorities `1..6` in a random assignment).
-4. The worker holding **priority 6** declares itself the **Initial Coordinator** and alerts the
-   other five.
+3. The first worker whose countdown expires claims **startup priority N**, the second **priority
+   N−1**, … the last **priority 1** (the Bootstrap Node sequences the claims, so each cold start
+   mints priorities `1..N` in a random assignment).
+4. The worker holding **priority N** declares itself the **Initial Coordinator** and alerts the
+   other N−1 workers.
 
 ### Phase 2 — Dynamic Segmented Task Distribution
 
@@ -335,10 +344,11 @@ the winner is broadcast to all participants and every worker records the same co
 
 ## Stopping the Cluster
 
-- **Server Manager**: click **Stop Workers** (each worker unregisters via its shutdown hook), then
-  close the window. Only workers that this session launched are stopped.
+- **One-command bootstrap (Option A)**: press **Ctrl+C** in the bootstrap terminal (or
+  `kill <pid>`). Its shutdown hook unregisters every worker node and stops each worker JVM it
+  launched this session.
 - **Launcher**: `java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher stop`.
-- **Manual terminals**: `Ctrl+C` the six worker terminals, then the Bootstrap terminal.
+- **Manual terminals**: `Ctrl+C` the worker terminals, then the Bootstrap terminal.
 - Left-over pid/log files are cleaned automatically or re-detected on the next start.
 
 ---
@@ -352,4 +362,4 @@ the winner is broadcast to all participants and every worker records the same co
 | `Coordinator term ended after 5 jobs ...` | Expected — the term expired; the next submission goes to the new coordinator. |
 | Port already in use | Another instance is running (pid files skip it); stop it first. |
 | GUI shows `ELECTING...` for a long time | Seconds-long is normal right after a term ends. If it persists, stop and restart the workers so they all re-run their staggered auto-election checks. |
-| Server/Client tables look empty | Click **Refresh** (Server Manager) or **Connect** (Client) — both views auto-refresh while connected. |
+| Server/Client tables look empty | Click **Refresh** or **Connect** (Client) — the client view auto-refreshes while connected. |
